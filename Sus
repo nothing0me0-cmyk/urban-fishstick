@@ -1,1 +1,3256 @@
 
+--[[
+═══════════════════════════════════════════════════════════════
+⚡ SOLO LEVELING SYSTEM - PRODUCTION READY
+Fixed: Description Positioning, Speed System, Kill Detection
+═══════════════════════════════════════════════════════════════
+]]
+
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Debris = game:GetService("Debris")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local rootPart = character:WaitForChild("HumanoidRootPart")
+
+-- ═══════════════════════════════════════════════════════════════
+-- 📱 DEVICE DETECTION & OPTIMIZATION
+-- ═══════════════════════════════════════════════════════════════
+
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+-- ═══════════════════════════════════════════════════════════════
+-- 🎮 CORE CONFIGURATION
+-- ═══════════════════════════════════════════════════════════════
+
+local Config = {
+    BASE_WALK_SPEED = 16,
+    MAX_WALK_SPEED = 100,
+    TSB_SPEED = 50,
+    BASE_DASH_RANGE = 30,
+    BASE_SHADOW_STEP_RANGE = 50,
+    BASE_SHADOW_STEP_COOLDOWN = 10,
+    LEVEL_CAP = 100,
+    MAX_STAT_VALUE = 100,
+    POINTS_PER_LEVEL = 3,
+    SHADOW_STEP_UNLOCK_LEVEL = 10,
+    RAMPAGE_UNLOCK_LEVEL = 25,
+    COMBAT_TIMEOUT = 5,
+    BASE_KILL_XP = 100,
+    ASSIST_XP_MULTIPLIER = 0.3,
+    BEHIND_YOU_MIN_RANGE = 10,
+    BEHIND_YOU_MAX_RANGE = 500,
+    VFX = {
+        SHADOW_PORTAL_PARTICLES = IS_MOBILE and 8 or 15,
+        LEVEL_UP_PARTICLES = IS_MOBILE and 20 or 40,
+        STAT_UPGRADE_ORBS = IS_MOBILE and 4 or 8,
+        RAMPAGE_AURA_DENSITY = IS_MOBILE and 12 or 25,
+        BEHIND_YOU_SMOKE = IS_MOBILE and 8 or 15,
+        RAMPAGE_NOTIFICATIONS = IS_MOBILE and 8 or 15
+    },
+    STAT_CURVES = {
+        strength = {damagePerPoint = 2, diminishingStart = 50, diminishingFactor = 0.8},
+        agility = {walkSpeedPerPoint = 0.84, dashSpeedPerPoint = 1.5},
+        perception = {
+            rangePerPoint = 10,
+            dashRangePerPoint = 0.5,
+            cooldownReductionPerPoint = 0.02,
+            maxCooldownReduction = 0.6,
+            rampageDurationPerPoint = 2.1,
+            behindYouCDReductionPerPoint = 0.15
+        },
+        vitality = {hpPerPoint = 20, regenPerPoint = 0.5, secondChanceThreshold = 10},
+        intelligence = {xpPerPoint = 5, cooldownBonusPerPoint = 0.01}
+    }
+}
+
+-- ═══════════════════════════════════════════════════════════════
+-- 🎨 PARTICLE POOL (PERFORMANCE OPTIMIZATION)
+-- ═══════════════════════════════════════════════════════════════
+
+local ParticlePool = {
+    pool = {},
+    maxPoolSize = 50,
+    activeParticles = {}
+}
+
+function ParticlePool:getParticle()
+    local particle = table.remove(self.pool)
+    
+    if not particle then
+        particle = Instance.new("Part")
+        particle.Anchored = true
+        particle.CanCollide = false
+        particle.Material = Enum.Material.Neon
+    end
+    
+    table.insert(self.activeParticles, particle)
+    return particle
+end
+
+function ParticlePool:returnParticle(particle)
+    if not particle or not particle.Parent then return end
+    
+    particle.Parent = nil
+    particle.Transparency = 1
+    
+    local index = table.find(self.activeParticles, particle)
+    if index then
+        table.remove(self.activeParticles, index)
+    end
+    
+    if #self.pool < self.maxPoolSize then
+        table.insert(self.pool, particle)
+    else
+        particle:Destroy()
+    end
+end
+
+function ParticlePool:clearAll()
+    for _, particle in ipairs(self.activeParticles) do
+        self:returnParticle(particle)
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 🔒 INPUT AUTHORITY
+-- ═══════════════════════════════════════════════════════════════
+
+local InputAuthority = {
+    systemBusy = false,
+    abilityActive = false,
+    uiAnimating = false
+}
+
+function InputAuthority:canUseAbility()
+    return not (self.systemBusy or self.abilityActive or self.uiAnimating)
+end
+
+function InputAuthority:canInteractUI()
+    return not (self.systemBusy or self.uiAnimating)
+end
+
+function InputAuthority:lockAbilities(duration)
+    self.abilityActive = true
+    if duration then
+        task.delay(duration, function()
+            self.abilityActive = false
+        end)
+    end
+end
+
+function InputAuthority:lockUI(duration)
+    self.uiAnimating = true
+    task.delay(duration, function()
+        self.uiAnimating = false
+    end)
+end
+
+function InputAuthority:lockSystem(duration)
+    self.systemBusy = true
+    task.delay(duration, function()
+        self.systemBusy = false
+    end)
+end
+
+function InputAuthority:unlockAll()
+    self.systemBusy = false
+    self.abilityActive = false
+    self.uiAnimating = false
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 💾 DATA PERSISTENCE
+-- ═══════════════════════════════════════════════════════════════
+
+local DataModule = {}
+local SAVE_FILE = "SoloLeveling_" .. player.UserId .. ".json"
+
+function DataModule.savePlayerData(data)
+    pcall(function()
+        if not writefile then return end
+        
+        local saveData = {
+            stats = data.stats,
+            level = data.level,
+            xp = data.xp,
+            availablePoints = data.availablePoints,
+            maxHP = data.maxHP,
+            shadowStep = {
+                level = data.shadowStep.level,
+                uses = data.shadowStep.uses,
+                unlocked = data.shadowStep.unlocked
+            },
+            rampage = {
+                unlocked = data.rampage.unlocked
+            },
+            metadata = {
+                version = "2.1",
+                lastSave = os.time(),
+                playerId = player.UserId
+            }
+        }
+        
+        local json = HttpService:JSONEncode(saveData)
+        writefile(SAVE_FILE, json)
+    end)
+end
+
+function DataModule.loadPlayerData()
+    local success, data = pcall(function()
+        if isfile and isfile(SAVE_FILE) then
+            local json = readfile(SAVE_FILE)
+            local decoded = HttpService:JSONDecode(json)
+            
+            if decoded.metadata and decoded.metadata.playerId == player.UserId then
+                return decoded
+            end
+        end
+        return nil
+    end)
+    
+    return success and data or nil
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 🎯 STATE MANAGER
+-- ═══════════════════════════════════════════════════════════════
+
+local StateManager = {
+    current = "CLOSED",
+    canTransition = true,
+    activeDescription = nil,
+    systemLocked = false
+}
+
+function StateManager:setState(newState, lockDuration)
+    if self.systemLocked then return false end
+    
+    local validTransitions = {
+        CLOSED = {"OPENING", "LOCKED"},
+        OPENING = {"OPEN", "CLOSING"},
+        OPEN = {"CLOSING", "LOCKED"},
+        CLOSING = {"CLOSED"},
+        LOCKED = {"OPENING", "CLOSED", "OPEN"}
+    }
+    
+    if not table.find(validTransitions[self.current] or {}, newState) then
+        return false
+    end
+    
+    self.current = newState
+    
+    if lockDuration then
+        self.canTransition = false
+        task.delay(lockDuration, function()
+            self.canTransition = true
+        end)
+    end
+    
+    return true
+end
+
+function StateManager:canInteract()
+    return self.current == "OPEN" and self.canTransition and not self.systemLocked
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 📢 NOTIFICATION QUEUE
+-- ═══════════════════════════════════════════════════════════════
+
+local NotificationQueue = {
+    queue = {},
+    isPlaying = false,
+    isPaused = false
+}
+
+function NotificationQueue:add(notification)
+    table.insert(self.queue, notification)
+    if not self.isPlaying then
+        self:playNext()
+    end
+end
+
+function NotificationQueue:playNext()
+    if #self.queue == 0 then
+        self.isPlaying = false
+        return
+    end
+    
+    if self.isPaused then return end
+    
+    self.isPlaying = true
+    local notif = table.remove(self.queue, 1)
+    
+    task.spawn(function()
+        self:spawnNotification(notif)
+        task.wait(notif.duration or 1.5)
+        self:playNext()
+    end)
+end
+
+function NotificationQueue:spawnNotification(notif)
+    if not rootPart then return end
+    
+    local part = ParticlePool:getParticle()
+    part.Transparency = 1
+    part.Size = Vector3.new(1, 1, 1)
+    part.CFrame = rootPart.CFrame * CFrame.new(notif.offset)
+    part.Parent = workspace
+
+    local gui = Instance.new("BillboardGui")
+    gui.Size = UDim2.new(0, 300, 0, 100)
+    gui.AlwaysOnTop = true
+    gui.StudsOffset = Vector3.new(0, 0, 0)
+    gui.Parent = part
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = notif.text
+    label.Font = Enum.Font.GothamBlack
+    label.TextScaled = true
+    label.TextColor3 = notif.color or Color3.fromRGB(255, 60, 60)
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = Color3.new(0, 0, 0)
+    label.Parent = gui
+
+    TweenService:Create(part, TweenInfo.new(notif.duration or 1.5), {
+        CFrame = part.CFrame * CFrame.new(0, 5, 0)
+    }):Play()
+    
+    TweenService:Create(label, TweenInfo.new(notif.duration or 1.5), {
+        TextTransparency = 1,
+        TextStrokeTransparency = 1
+    }):Play()
+
+    task.delay((notif.duration or 1.5) + 0.1, function()
+        gui:Destroy()
+        ParticlePool:returnParticle(part)
+    end)
+end
+
+function NotificationQueue:pause()
+    self.isPaused = true
+end
+
+function NotificationQueue:resume()
+    self.isPaused = false
+    if not self.isPlaying and #self.queue > 0 then
+        self:playNext()
+    end
+end
+
+function NotificationQueue:clear()
+    self.queue = {}
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 🎯 FOLLOW CONTROLLER (FIXED DESCRIPTION POSITIONING)
+-- ═══════════════════════════════════════════════════════════════
+
+local FollowController = {
+    mainPart = nil,
+    descriptionPart = nil,
+    lastKnownCFrame = nil,
+    teleportThreshold = 50,
+    updateConnection = nil,
+    isPaused = false,
+    needsResync = false,
+    dashCooldown = 0
+}
+
+function FollowController:initialize(part)
+    self.mainPart = part
+    self.lastKnownCFrame = rootPart.CFrame
+    self:startFollowing()
+end
+
+function FollowController:setDescriptionPart(part)
+    self.descriptionPart = part
+end
+
+function FollowController:detectTeleport()
+    if not self.lastKnownCFrame or not rootPart then return false end
+    
+    local distance = (rootPart.CFrame.Position - self.lastKnownCFrame.Position).Magnitude
+    self.lastKnownCFrame = rootPart.CFrame
+    
+    return distance > self.teleportThreshold
+end
+
+function FollowController:signalMovementOverride()
+    self.needsResync = true
+    self.isPaused = true
+    self.dashCooldown = 0.5
+    task.delay(0.5, function()
+        self.isPaused = false
+        self:forceResync()
+    end)
+end
+
+function FollowController:forceResync()
+    if not rootPart or not self.mainPart then return end
+    
+    local characterLook = rootPart.CFrame.LookVector
+    local targetPos = rootPart.Position + (characterLook * 8) + Vector3.new(0, 2, 0)
+    local lookAtPos = Vector3.new(rootPart.Position.X, self.mainPart.Position.Y, rootPart.Position.Z)
+    
+    self.mainPart.CFrame = CFrame.new(targetPos, lookAtPos)
+    
+    if self.descriptionPart and self.descriptionPart.Parent then
+        -- CRITICAL FIX: Position description IN FRONT of main UI (negative Z offset)
+        self.descriptionPart.CFrame = self.mainPart.CFrame * CFrame.new(0, 0, -3)
+    end
+    
+    self.needsResync = false
+    self.lastKnownCFrame = rootPart.CFrame
+end
+
+function FollowController:smoothFollow()
+    if not rootPart or not self.mainPart then return end
+    if StateManager.systemLocked or self.isPaused then return end
+    
+    if self.dashCooldown > 0 then
+        self.dashCooldown = math.max(0, self.dashCooldown - 0.1)
+        return
+    end
+    
+    if self:detectTeleport() or self.needsResync then
+        self:forceResync()
+        return
+    end
+    
+    local distance = (self.mainPart.Position - rootPart.Position).Magnitude
+    
+    if distance > 25 then
+        self:forceResync()
+    elseif distance > 12 then
+        local characterLook = rootPart.CFrame.LookVector
+        local targetPos = rootPart.Position + (characterLook * 8) + Vector3.new(0, 2, 0)
+        local lookAtPos = Vector3.new(rootPart.Position.X, self.mainPart.Position.Y, rootPart.Position.Z)
+        self.mainPart.CFrame = self.mainPart.CFrame:Lerp(CFrame.new(targetPos, lookAtPos), 0.12)
+    else
+        local lookAtPos = Vector3.new(rootPart.Position.X, self.mainPart.Position.Y, rootPart.Position.Z)
+        self.mainPart.CFrame = self.mainPart.CFrame:Lerp(CFrame.new(self.mainPart.Position, lookAtPos), 0.12)
+    end
+    
+    if self.descriptionPart and self.descriptionPart.Parent then
+        -- Keep description in front
+        self.descriptionPart.CFrame = self.mainPart.CFrame * CFrame.new(0, 0, -3)
+    end
+end
+
+function FollowController:startFollowing()
+    if self.updateConnection then
+        self.updateConnection:Disconnect()
+    end
+    
+    self.updateConnection = RunService.Heartbeat:Connect(function()
+        self:smoothFollow()
+    end)
+end
+
+function FollowController:stopFollowing()
+    if self.updateConnection then
+        self.updateConnection:Disconnect()
+        self.updateConnection = nil
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 📊 STAT INFO
+-- ═══════════════════════════════════════════════════════════════
+
+local StatInfo = {
+    strength = {
+        name = "Strength",
+        abbr = "STR",
+        color = Color3.fromRGB(239, 68, 68),
+        title = "🟥 STRENGTH (STR)",
+        description = [[Physical Power & Combat Damage
+
+EFFECTS:
+• Increases melee damage output
+• +2% damage per point
+• Enhances Rampage mode damage
+• Diminishing returns after 50 points
+
+COMBAT BENEFITS:
+• Higher kill potential
+• Faster enemy elimination
+• Increased threat level
+
+SCALING:
+• Linear: 0-50 points (+2% each)
+• Diminished: 50-100 points (+1.6% each)
+
+RECOMMENDED FOR:
+• Aggressive playstyle
+• Boss encounters
+• Pure damage dealers]],
+        getEffect = function(val)
+            local dmg = val * 2
+            if val > 50 then
+                dmg = 50 * 2 + ((val - 50) * 2 * 0.8)
+            end
+            return string.format("+%d%% DMG", math.floor(dmg))
+        end
+    },
+    
+    agility = {
+        name = "Agility",
+        abbr = "AGI",
+        color = Color3.fromRGB(34, 197, 94),
+        title = "🟩 AGILITY (AGI)",
+        description = [[Speed & Movement Control
+
+EFFECTS:
+• Increases walk speed (+0.84 per point)
+• Improves dash speed (+150% per point)
+• Reduces dash recovery time
+• Enhances movement fluidity
+
+MOVEMENT BENEFITS:
+• Faster combat repositioning
+• Better chase/escape capability
+• Improved mobility in Rampage
+
+SCALING:
+• Walk Speed: +0.84 per point
+• Dash Speed: +1.5x per point
+• Maximum walk speed: 100
+
+RECOMMENDED FOR:
+• Mobile playstyle
+• Hit-and-run tactics
+• Speed runners]],
+        getEffect = function(val)
+            return string.format("+%d SPD", math.floor(val * 0.84))
+        end
+    },
+    
+    perception = {
+        name = "Perception",
+        abbr = "PER",
+        color = Color3.fromRGB(250, 204, 21),
+        title = "🟨 PERCEPTION (PER)",
+        description = [[Battle Control & Awareness
+
+EFFECTS:
+• +10 studs ability range per point
+• +0.5 studs dash range per point
+• -2% ability cooldown per point
+
+ABILITY BENEFITS:
+• Longer Shadow Step range
+• Extended Behind You range
+• Increased Rampage duration
+• Better cooldown efficiency
+
+SCALING:
+• Range: +10 studs per point
+• Dash Range: +0.5 per point
+• Cooldown: -2% per point (max -60%)
+
+RECOMMENDED FOR:
+• Tactical players
+• Ability-focused playstyle]],
+        getEffect = function(val)
+            return string.format("+%d RNG", val * 10)
+        end
+    },
+    
+    vitality = {
+        name = "Vitality",
+        abbr = "VIT",
+        color = Color3.fromRGB(168, 85, 247),
+        title = "🟪 VITALITY (VIT)",
+        description = [[Body Toughness & Endurance
+
+EFFECTS:
+• Increases maximum health (+20 HP per point)
+• Improves health regeneration (+0.5 HP/s)
+• Unlocks Second Chance (10+ VIT)
+
+SECOND CHANCE SYSTEM:
+• Requires: 10+ Vitality
+• Effect: Revive at 50% HP on death
+• Cooldown: 60 seconds
+
+SCALING:
+• Max HP: +20 per point
+• Regen: +0.5 HP/second per point
+• Second Chance: Active at 10+ VIT
+
+RECOMMENDED FOR:
+• Tank builds
+• Survival-focused players
+• Solo content]],
+        getEffect = function(val)
+            return string.format("+%d HP", val * 20)
+        end
+    },
+    
+    intelligence = {
+        name = "Intelligence",
+        abbr = "INT",
+        color = Color3.fromRGB(59, 130, 246),
+        title = "🟦 INTELLIGENCE (INT)",
+        description = [[Tactical Mind & System Efficiency
+
+EFFECTS:
+• Increases XP gain (+5 XP per point per kill)
+• Reduces ability cooldowns (-1% per point)
+
+PROGRESSION BENEFITS:
+• Faster leveling
+• More stat points over time
+• Accelerated growth
+
+ABILITY BENEFITS:
+• Shorter Shadow Step cooldown
+• Faster Rampage recharge
+• Better ability uptime
+
+SCALING:
+• XP Bonus: +5 per kill per point
+• Cooldown: -1% per point
+
+RECOMMENDED FOR:
+• Fast progression
+• Efficiency-focused players]],
+        getEffect = function(val)
+            return string.format("+%d XP", val * 5)
+        end
+    }
+}
+
+-- ═══════════════════════════════════════════════════════════════
+-- 📊 ABILITY CODEX
+-- ═══════════════════════════════════════════════════════════════
+
+local AbilityCodex = {
+    ShadowStep = {
+        name = "Shadow Step",
+        category = "Movement",
+        unlockLevel = 10,
+        baseDescription = [[Teleport through shadows to target location.
+
+DESCRIPTION:
+Phase through the shadow realm to instantly
+relocate. Pass through walls and obstacles.
+
+MECHANICS:
+• Instant teleportation
+• Wall penetration
+• Camera-directed targeting
+
+LEVELING SYSTEM:
+• Max Level: 50
+• XP per use: 1
+• Level 1-10: 5 uses per level
+• Level 11-50: 8 uses per level
+
+STAT SCALING:
+• Perception: +10 range per point
+• Perception: -2% cooldown per point
+• Intelligence: -1% cooldown per point
+
+INPUT:
+• Keyboard: E
+• Button: Shadow Step]],
+        
+        getFullDescription = function(self, data)
+            local range = Config.BASE_SHADOW_STEP_RANGE + (data.stats.perception * Config.STAT_CURVES.perception.rangePerPoint)
+            local cdReduction = math.clamp(
+                data.stats.perception * Config.STAT_CURVES.perception.cooldownReductionPerPoint,
+                0,
+                Config.STAT_CURVES.perception.maxCooldownReduction
+            )
+            local baseCooldown = Config.BASE_SHADOW_STEP_COOLDOWN * (1 - cdReduction)
+            local finalCooldown = baseCooldown * math.max(
+                1 - (data.stats.intelligence * Config.STAT_CURVES.intelligence.cooldownBonusPerPoint),
+                0.5
+            )
+            
+            local usesNeeded = data.shadowStep.level <= 10 and 5 or 8
+            
+            return string.format([[%s
+
+CURRENT STATISTICS:
+Range: %.1f studs
+Cooldown: %.1f seconds
+Level: %d / 50
+Progress: %d / %d uses
+
+STAT CONTRIBUTIONS:
+Perception (%d):
+  Range Bonus: +%.1f studs
+  Cooldown Reduction: -%.1f%%
+
+Intelligence (%d):
+  Cooldown Reduction: -%.1f%%
+
+Total Cooldown Reduction: -%.1f%%]], 
+                self.baseDescription, 
+                range, 
+                finalCooldown, 
+                data.shadowStep.level,
+                data.shadowStep.uses,
+                usesNeeded,
+                data.stats.perception,
+                data.stats.perception * Config.STAT_CURVES.perception.rangePerPoint,
+                cdReduction * 100,
+                data.stats.intelligence,
+                data.stats.intelligence * Config.STAT_CURVES.intelligence.cooldownBonusPerPoint * 100,
+                (cdReduction + (data.stats.intelligence * Config.STAT_CURVES.intelligence.cooldownBonusPerPoint)) * 100
+            )
+        end
+    },
+    
+    Rampage = {
+        name = "Rampage",
+        category = "Ultimate",
+        unlockLevel = 25,
+        baseDescription = [[Enter awakened state with maxed stats.
+
+DESCRIPTION:
+Channel overwhelming power, temporarily
+setting all stats to 100. Unlocks exclusive
+"Behind You" ability during activation.
+
+ACTIVATION SEQUENCE:
+• Dramatic awakening cutscene (6.5s)
+• Screen effects and notifications
+• Full stat transformation
+
+EFFECTS DURING RAMPAGE:
+• All stats set to 100
+• Maximum movement speed
+• Enhanced damage output
+• Behind You ability unlocked
+• Instant Shadow Step cooldown reset
+
+RECHARGE SYSTEM:
+• Cooldown: 300 seconds (5 minutes)
+
+STRATEGIC USAGE:
+• Boss encounters
+• Multiple enemy situations
+• Maximum damage windows
+
+INPUT:
+• Keyboard: R
+• Button: RAGE]],
+        
+        getFullDescription = function(self, data)
+            local duration = math.min(
+                90 + (data.stats.perception * Config.STAT_CURVES.perception.rampageDurationPerPoint),
+                300
+            )
+            
+            local cooldownStatus = data.rampage.cooldown > 0 and string.format("%.0f seconds", data.rampage.cooldown) or "READY"
+            
+            return string.format([[%s
+
+CURRENT STATISTICS:
+Duration: %.0f seconds
+Cooldown: %s
+Status: %s
+
+STAT CONTRIBUTIONS:
+Perception (%d):
+  Duration Bonus: +%.0f seconds
+  Base Duration: 90 seconds
+  Total Duration: %.0f seconds
+
+ACTIVE EFFECTS:
+• Strength → 100 (Damage Maximized)
+• Agility → 100 (Speed Maximized)
+• Perception → 100 (Range Maximized)
+• Vitality → 100 (Health Maximized)
+• Intelligence → 100 (XP/Cooldown Maximized)
+• Behind You Ability Unlocked]], 
+                self.baseDescription,
+                duration,
+                cooldownStatus,
+                data.rampage.cooldown > 0 and "RECHARGING" or "READY",
+                data.stats.perception,
+                data.stats.perception * Config.STAT_CURVES.perception.rampageDurationPerPoint,
+                duration
+            )
+        end
+    },
+    
+    BehindYou = {
+        name = "Behind You",
+        category = "Rampage-Only",
+        unlockLevel = 25,
+        baseDescription = [[Instantly teleport behind nearest enemy.
+
+DESCRIPTION:
+Exclusive Rampage ability. Instantly appear
+behind the nearest valid target within range.
+
+REQUIREMENTS:
+• Rampage must be active
+• Enemy within 10-500 studs
+• Not on cooldown
+
+MECHANICS:
+• Auto-targets nearest valid enemy
+• Appears behind target's back
+• Range: 10-500 studs
+
+STAT SCALING:
+• Perception: -15% cooldown per point
+• Minimum cooldown: 5 seconds
+
+INPUT:
+• Keyboard: F
+• Button: BEHIND YOU (during Rampage)]],
+        
+        getFullDescription = function(self, data)
+            local cooldown = math.max(
+                20 * (1 - math.clamp(data.stats.perception * Config.STAT_CURVES.perception.behindYouCDReductionPerPoint, 0, 0.75)),
+                5
+            )
+            
+            local cooldownReduction = math.clamp(data.stats.perception * Config.STAT_CURVES.perception.behindYouCDReductionPerPoint, 0, 0.75) * 100
+            
+            return string.format([[%s
+
+CURRENT STATISTICS:
+Cooldown: %.1f seconds
+Minimum Range: %d studs
+Maximum Range: %d studs
+Status: %s
+
+STAT CONTRIBUTIONS:
+Perception (%d):
+  Cooldown Reduction: -%.1f%%
+  Base Cooldown: 20 seconds
+  Current Cooldown: %.1f seconds
+
+TARGETING DETAILS:
+Range Requirements:
+• Minimum: %d studs
+• Maximum: %d studs
+• Selects nearest valid enemy
+
+ACTIVATION REQUIREMENTS:
+%s Rampage Mode Active
+%s Cooldown Ready
+%s Valid Target in Range]], 
+                self.baseDescription,
+                cooldown,
+                Config.BEHIND_YOU_MIN_RANGE,
+                Config.BEHIND_YOU_MAX_RANGE,
+                data.rampage.isActive and "AVAILABLE" or "REQUIRES RAMPAGE",
+                data.stats.perception,
+                cooldownReduction,
+                cooldown,
+                Config.BEHIND_YOU_MIN_RANGE,
+                Config.BEHIND_YOU_MAX_RANGE,
+                data.rampage.isActive and "✓" or "✗",
+                data.behindYou.cooldown <= 0 and "✓" or "✗",
+                data.rampage.isActive and "✓" or "✗"
+            )
+        end
+    }
+}
+
+function AbilityCodex:getAbilityInfo(abilityName, playerData)
+    local ability = self[abilityName]
+    if not ability then return nil end
+    
+    return {
+        name = ability.name,
+        category = ability.category,
+        unlockLevel = ability.unlockLevel,
+        description = ability:getFullDescription(playerData)
+    }
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 📊 PLAYER DATA
+-- ═══════════════════════════════════════════════════════════════
+
+local savedData = DataModule.loadPlayerData()
+
+local PlayerData = {
+    stats = savedData and savedData.stats or {strength = 0,
+agility = 0,
+perception = 0,
+vitality = 0,
+intelligence = 0
+},
+level = savedData and savedData.level or 1,
+xp = savedData and savedData.xp or 0,
+maxHP = savedData and savedData.maxHP or 100,
+availablePoints = savedData and savedData.availablePoints or 5,
+shadowStep = {
+level = savedData and savedData.shadowStep and savedData.shadowStep.level or 1,
+uses = savedData and savedData.shadowStep and savedData.shadowStep.uses or 0,
+unlocked = savedData and savedData.shadowStep and savedData.shadowStep.unlocked or false,
+cooldown = 0,
+isActive = false
+},
+rampage = {
+unlocked = savedData and savedData.rampage and savedData.rampage.unlocked or false,
+isActive = false,
+duration = 90,
+cooldown = 0,
+maxCooldown = 300,
+originalStats = nil
+},
+behindYou = {
+cooldown = 0,
+maxCooldown = 20,
+minCooldown = 5
+},
+damageDealt = {},
+hasSecondChance = true
+}
+-- ═══════════════════════════════════════════════════════════════
+-- 📈 RANK DATA
+-- ═══════════════════════════════════════════════════════════════
+local RankData = {
+{name = "E-RANK", level = 1, color = Color3.fromRGB(176, 176, 176), title = "The Weakest Hunter", status = "NORMAL"},
+{name = "D-RANK", level = 10, color = Color3.fromRGB(79, 195, 247), title = "Awakened", status = "NORMAL"},
+{name = "C-RANK", level = 20, color = Color3.fromRGB(76, 175, 80), title = "Elite Hunter", status = "NORMAL"},
+{name = "B-RANK", level = 35, color = Color3.fromRGB(255, 193, 7), title = "Elite Hunter", status = "HIGH"},
+{name = "A-RANK", level = 50, color = Color3.fromRGB(255, 112, 67), title = "Apex Hunter", status = "RARE"},
+{name = "S-RANK", level = 70, color = Color3.fromRGB(211, 47, 47), title = "National Threat", status = "EXTREMELY RARE"},
+{name = "NATIONAL", level = 90, color = Color3.fromRGB(138, 43, 226), title = "National Power", status = "CLASSIFIED"},
+{name = "MONARCH", level = 100, color = Color3.fromRGB(0, 0, 0), title = "Shadow Monarch", status = "UNKNOWN"}
+}
+-- ═══════════════════════════════════════════════════════════════
+-- 🏃 TSB SPEED SYSTEM (BODYVELOCITY INTEGRATION)
+-- ═══════════════════════════════════════════════════════════════
+local SpeedController = {
+bodyVelocity = nil,
+heartbeatConnection = nil,
+isActive = false
+}
+function SpeedController:activate(character)
+if not character then return end
+local hum = character:FindFirstChild("Humanoid")
+local root = character:FindFirstChild("HumanoidRootPart")
+
+if not hum or not root then return end
+
+self:deactivate()
+
+self.bodyVelocity = Instance.new("BodyVelocity")
+self.bodyVelocity.MaxForce = Vector3.new(4000, 0, 4000)
+self.bodyVelocity.Velocity = Vector3.new(0, 0, 0)
+self.bodyVelocity.Parent = root
+
+self.heartbeatConnection = RunService.Heartbeat:Connect(function()
+    if not hum or not root or not self.bodyVelocity then
+        self:deactivate()
+        return
+    end
+    
+    local speed = Config.TSB_SPEED
+    if PlayerData.rampage.isActive then
+        speed = Config.TSB_SPEED + (PlayerData.stats.agility * Config.STAT_CURVES.agility.dashSpeedPerPoint)
+    else
+        speed = Config.TSB_SPEED + (PlayerData.stats.agility * Config.STAT_CURVES.agility.dashSpeedPerPoint * 0.5)
+    end
+    
+    if hum.MoveDirection.Magnitude > 0 then
+        self.bodyVelocity.Velocity = hum.MoveDirection * speed
+    else
+        self.bodyVelocity.Velocity = Vector3.new(0, 0, 0)
+    end
+end)
+
+self.isActive = true
+end
+function SpeedController:deactivate()
+if self.bodyVelocity then
+self.bodyVelocity:Destroy()
+self.bodyVelocity = nil
+end
+if self.heartbeatConnection then
+    self.heartbeatConnection:Disconnect()
+    self.heartbeatConnection = nil
+end
+
+self.isActive = false
+end
+-- ═══════════════════════════════════════════════════════════════
+-- 🧮 STAT CALCULATOR
+-- ═══════════════════════════════════════════════════════════════
+local StatCalculator = {}
+function StatCalculator.applyStatEffects()
+if not humanoid then return end
+local stats = PlayerData.stats
+local curves = Config.STAT_CURVES
+local healthPercent = humanoid.Health / humanoid.MaxHealth
+
+humanoid.WalkSpeed = math.min(
+    Config.BASE_WALK_SPEED + (stats.agility * curves.agility.walkSpeedPerPoint),
+    Config.MAX_WALK_SPEED
+)
+
+_G.dashRange = Config.BASE_DASH_RANGE + (stats.perception * curves.perception.dashRangePerPoint)
+_G.shadowStepRange = Config.BASE_SHADOW_STEP_RANGE + (stats.perception * curves.perception.rangePerPoint)
+
+local cdReduction = math.clamp(
+    stats.perception * curves.perception.cooldownReductionPerPoint,
+    0,
+    curves.perception.maxCooldownReduction
+)
+_G.shadowStepMaxCooldown = Config.BASE_SHADOW_STEP_COOLDOWN * (1 - cdReduction)
+_G.shadowStepMaxCooldown = _G.shadowStepMaxCooldown * math.max(
+    1 - (stats.intelligence * curves.intelligence.cooldownBonusPerPoint),
+    0.5
+)
+
+PlayerData.rampage.duration = math.min(
+    90 + (stats.perception * curves.perception.rampageDurationPerPoint),
+    300
+)
+
+PlayerData.behindYou.maxCooldown = math.max(
+    20 * (1 - math.clamp(stats.perception * curves.perception.behindYouCDReductionPerPoint, 0, 0.75)),
+    PlayerData.behindYou.minCooldown
+)
+
+PlayerData.maxHP = 100 + (stats.vitality * curves.vitality.hpPerPoint)
+humanoid.MaxHealth = PlayerData.maxHP
+humanoid.Health = PlayerData.maxHP * healthPercent
+
+PlayerData.hasSecondChance = stats.vitality >= curves.vitality.secondChanceThreshold
+
+DataModule.savePlayerData(PlayerData)
+end
+function StatCalculator.getDamageMultiplier()
+local str = PlayerData.stats.strength
+local damage = str * 2
+if str > 50 then
+damage = 50 * 2 + ((str - 50) * 2 * 0.8)
+end
+return 1 + (damage / 100)
+end
+function StatCalculator.getXPBonus()
+return PlayerData.stats.intelligence * 5
+end
+-- ═══════════════════════════════════════════════════════════════
+-- 📊 LEVEL SYSTEM
+-- ═══════════════════════════════════════════════════════════════
+local LevelSystem = {}
+function LevelSystem.calculateRequiredXP(level)
+return math.floor(100 * (level ^ 1.15))
+end
+function LevelSystem.getCurrentRank()
+for i = #RankData, 1, -1 do
+if PlayerData.level >= RankData[i].level then
+return RankData[i]
+end
+end
+return RankData[1]
+end
+function LevelSystem.getCurrentClass()
+if PlayerData.level >= 100 then return "Shadow Monarch"
+elseif PlayerData.level >= 71 then return "Shadow Commander"
+elseif PlayerData.level >= 41 then return "Shadow Warrior"
+elseif PlayerData.level >= 21 then return "Shadow Adept"
+else return "Unclassified" end
+end
+function LevelSystem.grantXP(amount)
+if PlayerData.rampage.isActive then return end
+PlayerData.xp = PlayerData.xp + amount
+
+local maxXP = LevelSystem.calculateRequiredXP(PlayerData.level)
+
+while PlayerData.xp >= maxXP and PlayerData.level < Config.LEVEL_CAP do
+    PlayerData.xp = PlayerData.xp - maxXP
+    PlayerData.level = PlayerData.level + 1
+    PlayerData.availablePoints = PlayerData.availablePoints + Config.POINTS_PER_LEVEL
+    
+    task.spawn(function()
+        EffectsModule.createLevelUpEffect()
+    end)
+    
+    PlayerData.maxHP = 100 + (PlayerData.stats.vitality * 20)
+    humanoid.MaxHealth = PlayerData.maxHP
+    humanoid.Health = PlayerData.maxHP
+    
+    if PlayerData.level >= Config.SHADOW_STEP_UNLOCK_LEVEL and not PlayerData.shadowStep.unlocked then
+        PlayerData.shadowStep.unlocked = true
+        UIModule.updateAbilityButtons()
+    end
+    
+    if PlayerData.level >= Config.RAMPAGE_UNLOCK_LEVEL and not PlayerData.rampage.unlocked then
+        PlayerData.rampage.unlocked = true
+        UIModule.updateAbilityButtons()
+        task.spawn(function()
+            EffectsModule.createRampageUnlockEffect()
+        end)
+    end
+    
+    maxXP = LevelSystem.calculateRequiredXP(PlayerData.level)
+end
+
+UIModule.updateUI()
+DataModule.savePlayerData(PlayerData)
+end
+-- ═══════════════════════════════════════════════════════════════
+-- ⚔️ COMBAT SYSTEM (FIXED KILL DETECTION)
+-- ═══════════════════════════════════════════════════════════════
+local CombatModule = {}
+function CombatModule.recordDamage(victimUserId, damage, victimHumanoid)
+if not victimHumanoid then return end
+if not PlayerData.damageDealt[victimUserId] then
+    PlayerData.damageDealt[victimUserId] = {
+        totalDamage = 0,
+        lastHit = tick(),
+        maxHealth = victimHumanoid.MaxHealth
+    }
+end
+
+PlayerData.damageDealt[victimUserId].totalDamage = PlayerData.damageDealt[victimUserId].totalDamage + damage
+PlayerData.damageDealt[victimUserId].lastHit = tick()
+end
+function CombatModule.validateKill(victimUserId)
+local data = PlayerData.damageDealt[victimUserId]
+if not data then return false end
+local timeSinceLastHit = tick() - data.lastHit
+local damagePercent = (data.totalDamage / data.maxHealth) * 100
+
+return timeSinceLastHit <= Config.COMBAT_TIMEOUT and damagePercent >= 20
+end
+function CombatModule.onPlayerKilled(victim)
+if not victim or not victim.UserId then return end
+local userId = victim.UserId
+
+if CombatModule.validateKill(userId) then
+    local totalXP = Config.BASE_KILL_XP + StatCalculator.getXPBonus()
+    LevelSystem.grantXP(totalXP)
+    
+    if rootPart then
+        task.spawn(function()
+            EffectsModule.createXPPopup(totalXP, rootPart.Position, "KILL")
+        end)
+    end
+    
+    PlayerData.damageDealt[userId] = nil
+end
+end
+function CombatModule.setupHealthMonitoring(otherPlayer)
+if not otherPlayer or not otherPlayer.Character then return end
+local otherHumanoid = otherPlayer.Character:FindFirstChild("Humanoid")
+if not otherHumanoid or otherHumanoid:GetAttribute("Monitored") then return end
+
+otherHumanoid:SetAttribute("Monitored", true)
+
+local lastHealth = otherHumanoid.Health
+
+otherHumanoid.HealthChanged:Connect(function(health)
+    if health < lastHealth and rootPart and otherPlayer.Character then
+        local otherRoot = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
+        
+        if otherRoot then
+            local distance = (rootPart.Position - otherRoot.Position).Magnitude
+            local damage = lastHealth - health
+            
+            if distance <= 35 then
+                CombatModule.recordDamage(otherPlayer.UserId, damage, otherHumanoid)
+            end
+        end
+    end
+    
+    lastHealth = health
+end)
+
+otherHumanoid.Died:Connect(function()
+    CombatModule.onPlayerKilled(otherPlayer)
+end)
+end
+-- ═══════════════════════════════════════════════════════════════
+-- ✨ EFFECTS MODULE
+-- ═══════════════════════════════════════════════════════════════
+EffectsModule = {}
+function EffectsModule.createXPPopup(amount, position, type)
+if PlayerData.rampage.isActive then return end
+local part = ParticlePool:getParticle()
+part.Size = Vector3.new(5, 3, 0.1)
+part.Position = position + Vector3.new(0, 4, 0)
+part.Transparency = 1
+part.Parent = workspace
+
+local gui = Instance.new("BillboardGui")
+gui.Size = UDim2.new(0, 300, 0, 150)
+gui.StudsOffset = Vector3.new(0, 2, 0)
+gui.AlwaysOnTop = true
+gui.Parent = part
+
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(1, 0, 1, 0)
+label.BackgroundTransparency = 1
+label.Font = Enum.Font.GothamBold
+label.TextSize = type == "KILL" and 36 or 28
+label.Text = type == "KILL" and ("+" .. amount .. " XP") or ("+" .. amount .. " XP [ASSIST]")
+label.TextColor3 = type == "KILL" and Color3.fromRGB(34, 211, 238) or Color3.fromRGB(250, 204, 21)
+label.Parent = gui
+
+TweenService:Create(gui, TweenInfo.new(1.5), {StudsOffset = Vector3.new(0, 5, 0)}):Play()
+TweenService:Create(label, TweenInfo.new(1.5), {TextTransparency = 1}):Play()
+
+task.delay(1.5, function()
+    gui:Destroy()
+    ParticlePool:returnParticle(part)
+end)
+end
+function EffectsModule.createLevelUpEffect()
+if not rootPart then return end
+for i = 1, 3 do
+    task.spawn(function()
+        local pillar = ParticlePool:getParticle()
+        pillar.Size = Vector3.new(10, 60, 10)
+        pillar.Position = rootPart.Position
+        pillar.Material = Enum.Material.Neon
+        pillar.Color = i == 1 and Color3.fromRGB(255, 215, 0) or i == 2 and Color3.fromRGB(255, 165, 0) or Color3.fromRGB(255, 255, 255)
+        pillar.Transparency = 0.3 + (i * 0.1)
+        pillar.Parent = workspace
+        
+        local mesh = Instance.new("CylinderMesh")
+        mesh.Parent = pillar
+        
+        task.wait(i * 0.1)
+        
+        TweenService:Create(pillar, TweenInfo.new(1.2), {
+            Transparency = 1,
+            Size = Vector3.new(15 + (i * 2), 60, 15 + (i * 2))
+        }):Play()
+        
+        task.delay(1.2, function()
+            mesh:Destroy()
+            ParticlePool:returnParticle(pillar)
+        end)
+    end)
+end
+
+local wave = ParticlePool:getParticle()
+wave.Size = Vector3.new(2, 0.5, 2)
+wave.Position = rootPart.Position
+wave.Material = Enum.Material.Neon
+wave.Color = Color3.fromRGB(255, 215, 0)
+wave.Transparency = 0.3
+wave.Parent = workspace
+
+local mesh = Instance.new("CylinderMesh")
+mesh.Parent = wave
+
+TweenService:Create(wave, TweenInfo.new(0.8), {
+    Size = Vector3.new(40, 0.5, 40),
+    Transparency = 1
+}):Play()
+
+task.delay(0.8, function()
+    mesh:Destroy()
+    ParticlePool:returnParticle(wave)
+end)
+
+for i = 1, Config.VFX.LEVEL_UP_PARTICLES do
+    task.spawn(function()
+        local part = ParticlePool:getParticle()
+        part.Size = Vector3.new(0.8, 0.8, 0.8)
+        part.Position = rootPart.Position + Vector3.new(
+            math.random(-4, 4),
+            math.random(-2, 4),
+            math.random(-4, 4)
+        )
+        part.Material = Enum.Material.Neon
+        part.Color = i % 2 == 0 and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(255, 255, 255)
+        part.Shape = Enum.PartType.Ball
+        part.Parent = workspace
+        
+        TweenService:Create(part, TweenInfo.new(1.5), {
+            Position = part.Position + Vector3.new(
+                math.random(-6, 6),
+                math.random(8, 15),
+                math.random(-6, 6)
+            ),
+            Transparency = 1,
+            Size = Vector3.new(0.1, 0.1, 0.1)
+        }):Play()
+        
+        task.delay(1.5, function()
+            ParticlePool:returnParticle(part)
+        end)
+    end)
+end
+end
+function EffectsModule.createStatUpgradeEffect(statName)
+if not rootPart then return end
+local statColor = StatInfo[statName].color
+
+for i = 1, Config.VFX.STAT_UPGRADE_ORBS do
+    local angle = (i / Config.VFX.STAT_UPGRADE_ORBS) * math.pi * 2
+    local part = ParticlePool:getParticle()
+    part.Size = Vector3.new(0.8, 0.8, 0.8)
+    part.Shape = Enum.PartType.Ball
+    part.Position = rootPart.Position + Vector3.new(
+        math.cos(angle) * 3,
+        2,
+        math.sin(angle) * 3
+    )
+    part.Material = Enum.Material.Neon
+    part.Color = statColor
+    part.Parent = workspace
+    
+    TweenService:Create(part, TweenInfo.new(0.8), {
+        Position = rootPart.Position + Vector3.new(0, 2, 0),
+        Transparency = 1,
+        Size = Vector3.new(0.2, 0.2, 0.2)
+    }):Play()
+    
+    task.delay(0.8, function()
+        ParticlePool:returnParticle(part)
+    end)
+end
+end
+function EffectsModule.createShadowPortal(position)
+local portal = ParticlePool:getParticle()
+portal.Size = Vector3.new(6, 0.4, 6)
+portal.Position = position
+portal.Material = Enum.Material.Neon
+portal.Color = Color3.fromRGB(10, 10, 10)
+portal.Transparency = 0.2
+portal.Parent = workspace
+local rim = ParticlePool:getParticle()
+rim.Size = Vector3.new(7, 0.5, 7)
+rim.Position = position
+rim.Material = Enum.Material.Neon
+rim.Color = Color3.fromRGB(138, 43, 226)
+rim.Transparency = 0.4
+rim.Parent = workspace
+
+local rimMesh = Instance.new("CylinderMesh")
+rimMesh.Parent = rim
+local portalMesh = Instance.new("CylinderMesh")
+portalMesh.Parent = portal
+
+for i = 1, Config.VFX.SHADOW_PORTAL_PARTICLES do
+    local particle = ParticlePool:getParticle()
+    particle.Size = Vector3.new(0.3, 0.3, 0.3)
+    particle.Position = position + Vector3.new(
+        math.random(-3, 3),
+        0.5,
+        math.random(-3, 3)
+    )
+    particle.Material = Enum.Material.Neon
+    particle.Color = Color3.fromRGB(138, 43, 226)
+    particle.Transparency = 0.5
+    particle.Parent = workspace
+    
+    TweenService:Create(particle, TweenInfo.new(0.5), {
+        Position = position + Vector3.new(0, 3, 0),
+        Transparency = 1
+    }):Play()
+    
+    task.delay(0.5, function()
+        ParticlePool:returnParticle(particle)
+    end)
+end
+
+TweenService:Create(portal, TweenInfo.new(0.5), {
+    Transparency = 1,
+    Size = Vector3.new(10, 0.4, 10)
+}):Play()
+
+TweenService:Create(rim, TweenInfo.new(0.5), {
+    Transparency = 1,
+    Size = Vector3.new(12, 0.5, 12)
+}):Play()
+
+task.delay(0.5, function()
+    portalMesh:Destroy()
+    rimMesh:Destroy()
+    ParticlePool:returnParticle(portal)
+    ParticlePool:returnParticle(rim)
+end)
+end
+function EffectsModule.createShadowStepTrail(startPos, endPos)
+for i = 1, 10 do
+local progress = i / 10
+local pos = startPos:Lerp(endPos, progress)
+local trail = ParticlePool:getParticle()
+    trail.Size = Vector3.new(1.5, 3, 1.5)
+    trail.Position = pos
+    trail.Material = Enum.Material.Neon
+    trail.Color = Color3.fromRGB(138, 43, 226)
+    trail.Transparency = 0.3
+    trail.Parent = workspace
+    
+    TweenService:Create(trail, TweenInfo.new(0.4), {
+        Transparency = 1,
+        Size = Vector3.new(0.5, 1, 0.5)
+    }):Play()
+    
+    task.delay(0.4, function()
+        ParticlePool:returnParticle(trail)
+    end)
+end
+end
+function EffectsModule.createSecondChanceEffect()
+if not rootPart then return end
+for i = 1, 20 do
+    local part = ParticlePool:getParticle()
+    part.Size = Vector3.new(0.8, 0.8, 0.8)
+    part.Position = rootPart.Position + Vector3.new(
+        math.random(-2, 2),
+        math.random(0, 3),
+        math.random(-2, 2)
+    )
+    part.Material = Enum.Material.Neon
+    part.Color = Color3.fromRGB(168, 85, 247)
+    part.Transparency = 0.3
+    part.Parent = workspace
+    
+    TweenService:Create(part, TweenInfo.new(1.2), {
+        Position = rootPart.Position,
+        Transparency = 1,
+        Size = Vector3.new(0.2, 0.2, 0.2)
+    }):Play()
+    
+    task.delay(1.2, function()
+        ParticlePool:returnParticle(part)
+    end)
+end
+end
+function EffectsModule.createRampageUnlockEffect()
+if not rootPart then return end
+local playerGui = player:WaitForChild("PlayerGui")
+local flash = Instance.new("Frame")
+flash.Size = UDim2.new(1, 0, 1, 0)
+flash.BackgroundColor3 = Color3.fromRGB(211, 47, 47)
+flash.BackgroundTransparency = 0
+flash.BorderSizePixel = 0
+flash.ZIndex = 100
+flash.Parent = playerGui
+
+TweenService:Create(flash, TweenInfo.new(1.5), {
+    BackgroundTransparency = 1
+}):Play()
+
+Debris:AddItem(flash, 1.5)
+
+NotificationQueue:add({
+    text = "RAMPAGE UNLOCKED",
+    offset = Vector3.new(0, 3, 0),
+    duration = 2,
+    color = Color3.fromRGB(255, 60, 60)
+})
+end
+function EffectsModule.create3DNotifications()
+local MESSAGES = {
+"SYSTEM ERROR", "LIMIT EXCEEDED", "STATUS UNSTABLE",
+"ACCESS DENIED", "EMERGENCY PROTOCOL", "FORCE OUTPUT HIGH",
+"STABILITY FALLING", "RECALIBRATING...", "LEVEL UP", "STATS PROMOTED"
+}
+local COUNT = Config.VFX.RAMPAGE_NOTIFICATIONS
+local RADIUS = 6
+local LIFE = 6
+local SHAKE = 0.15
+for i = 1, COUNT do
+    task.spawn(function()
+        local part = Instance.new("Part")
+        part.Size = Vector3.new(10, 5, 0.2)
+        part.Anchored = true
+        part.CanCollide = false
+        part.Material = Enum.Material.Neon
+        part.Color = Color3.fromRGB(0, 0, 50)
+        part.Transparency = 0.4
+        part.Parent = workspace
+
+        local angle = math.rad(math.random() * 360)
+        local height = math.random(-2, 5)
+        local offset = Vector3.new(math.cos(angle) * RADIUS, height, math.sin(angle) * RADIUS)
+        part.CFrame = rootPart.CFrame + offset
+
+        local billboard = Instance.new("BillboardGui")
+        billboard.Adornee = part
+        billboard.Size = UDim2.new(1, 0, 1, 0)
+        billboard.AlwaysOnTop = true
+        billboard.ExtentsOffset = Vector3.new(0, 0, 0)
+        billboard.Parent = part
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, 0, 1, 0)
+        label.BackgroundTransparency = 1
+        label.Text = MESSAGES[math.random(1, #MESSAGES)]
+        label.TextColor3 = Color3.fromRGB(200, 220, 255)
+        label.TextStrokeTransparency = 0
+        label.Font = Enum.Font.GothamBold
+        label.TextScaled = true
+        label.Parent = billboard
+
+        local direction = Vector3.new(math.random(-5, 5) / 100, math.random(-5, 5) / 100, math.random(-5, 5) / 100)
+        local alpha = 0
+        local conn
+        conn = RunService.Heartbeat:Connect(function(dt)
+            if not rootPart or not part.Parent then
+                conn:Disconnect()
+                return
+            end
+            alpha = alpha + dt
+            local shakeOffset = Vector3.new(
+                (math.random() - 0.5) * SHAKE,
+                (math.random() - 0.5) * SHAKE,
+                (math.random() - 0.5) * SHAKE
+            )
+            part.CFrame = CFrame.new(rootPart.Position + offset + direction * math.sin(alpha * 3) + shakeOffset, rootPart.Position)
+        end)
+
+        task.delay(LIFE, function()
+            TweenService:Create(part, TweenInfo.new(0.7), {Transparency = 1}):Play()
+            Debris:AddItem(part, 0.7)
+            conn:Disconnect()
+        end)
+    end)
+end
+end
+function EffectsModule.createSungJinWooAura()
+if not rootPart then return end
+local auraConnection
+local auraParticles = {}
+
+for i = 1, 8 do
+    local angle = (i / 8) * math.pi * 2
+    local aura = Instance.new("Part")
+    aura.Size = Vector3.new(2, 4, 0.2)
+    aura.Position = rootPart.Position + Vector3.new(math.cos(angle) * 4, 0, math.sin(angle) * 4)
+    aura.Anchored = true
+    aura.CanCollide = false
+    aura.Material = Enum.Material.Neon
+    aura.Color = Color3.fromRGB(139, 0, 0)
+    aura.Transparency = 0.5
+    aura.Parent = workspace
+    table.insert(auraParticles, {part = aura, angle = angle, height = 0})
+end
+
+auraConnection = RunService.Heartbeat:Connect(function(dt)
+    if not PlayerData.rampage.isActive or not rootPart then
+        for _, data in pairs(auraParticles) do
+            if data.part then data.part:Destroy() end
+        end
+        if auraConnection then auraConnection:Disconnect() end
+        return
+    end
+    
+    for _, data in pairs(auraParticles) do
+if data.part and data.part.Parent then
+data.angle = data.angle + dt * 2
+data.height = math.sin(tick() * 3 + data.angle) * 2
+local pos = rootPart.Position + Vector3.new(
+math.cos(data.angle) * 4,
+data.height,
+math.sin(data.angle) * 4
+)
+data.part.CFrame = CFrame.new(pos, rootPart.Position)
+end
+end
+if math.random() > 0.7 then
+        local particle = ParticlePool:getParticle()
+        particle.Size = Vector3.new(0.5, 0.5, 0.5)
+        particle.Position = rootPart.Position + Vector3.new(
+            math.random(-3, 3),
+            math.random(-1, 3),
+            math.random(-3, 3)
+        )
+        particle.Material = Enum.Material.Neon
+        particle.Color = Color3.fromRGB(139, 0, 0)
+        particle.Transparency = 0.3
+        particle.Parent = workspace
+        
+        TweenService:Create(particle, TweenInfo.new(0.7), {
+            Position = particle.Position + Vector3.new(0, 3, 0),
+            Transparency = 1,
+            Size = Vector3.new(0.1, 0.1, 0.1)
+        }):Play()
+        
+        task.delay(0.7, function()
+            ParticlePool:returnParticle(particle)
+        end)
+    end
+end)
+end
+function EffectsModule.createRampageCutscene()
+local camera = workspace.CurrentCamera
+local originalCFrame = camera.CFrame
+local originalFOV = camera.FieldOfView
+StateManager.systemLocked = true
+InputAuthority:lockSystem(6.5)
+NotificationQueue:pause()
+NotificationQueue:clear()
+
+humanoid.WalkSpeed = 0
+humanoid.JumpPower = 0
+
+local playerGui = player:WaitForChild("PlayerGui")
+local redFlash = Instance.new("Frame")
+redFlash.Size = UDim2.new(1, 0, 1, 0)
+redFlash.BackgroundColor3 = Color3.fromRGB(139, 0, 0)
+redFlash.BackgroundTransparency = 1
+redFlash.BorderSizePixel = 0
+redFlash.ZIndex = 99
+redFlash.Parent = playerGui
+
+for i = 1, 16 do
+    task.spawn(function()
+        local angle = (i / 16) * math.pi * 2
+        local crack = ParticlePool:getParticle()
+        crack.Size = Vector3.new(1.5, 0.8, 12)
+        crack.Position = rootPart.Position + Vector3.new(
+            math.cos(angle) * 5,
+            -2.5,
+            math.sin(angle) * 5
+        )
+        crack.Material = Enum.Material.Neon
+        crack.Color = Color3.fromRGB(139, 0, 0)
+        crack.Transparency = 0.2
+        crack.Parent = workspace
+        
+        TweenService:Create(crack, TweenInfo.new(0.6), {
+            Size = Vector3.new(2, 0.8, 20),
+            Transparency = 1
+        }):Play()
+        
+        task.delay(0.6, function()
+            ParticlePool:returnParticle(crack)
+        end)
+    end)
+end
+
+task.spawn(function()
+    for i = 1, 80 do
+        if not camera then break end
+        local intensity = (i <= 40 and (i / 40) or (80 - i) / 40) * 1.5
+        camera.CFrame = originalCFrame * CFrame.Angles(
+            math.rad(math.random(-8, 8) * intensity),
+            math.rad(math.random(-8, 8) * intensity),
+            math.rad(math.random(-5, 5) * intensity)
+        )
+        camera.FieldOfView = originalFOV + (math.sin(i / 5) * 10 * intensity)
+        task.wait(0.025)
+    end
+    if camera then
+        camera.CFrame = originalCFrame
+        camera.FieldOfView = originalFOV
+    end
+end)
+
+task.spawn(function()
+    for i = 1, 4 do
+        TweenService:Create(redFlash, TweenInfo.new(0.15), {BackgroundTransparency = 0.3}):Play()
+        task.wait(0.15)
+        TweenService:Create(redFlash, TweenInfo.new(0.15), {BackgroundTransparency = 0.9}):Play()
+        task.wait(0.4)
+    end
+end)
+
+task.wait(2)
+
+task.spawn(function()
+    EffectsModule.create3DNotifications()
+end)
+
+NotificationQueue:add({
+    text = "AWAKENING",
+    offset = Vector3.new(0, 5, 0),
+    duration = 1.2,
+    color = Color3.fromRGB(255, 60, 60)
+})
+task.wait(1.2)
+
+local statOrder = {"strength", "perception", "agility", "vitality", "intelligence"}
+for i, statName in ipairs(statOrder) do
+    local angle = ((i - 1) / #statOrder) * math.pi * 2
+    local offset = Vector3.new(
+        math.cos(angle) * 4,
+        4,
+        math.sin(angle) * 4
+    )
+    NotificationQueue:add({
+        text = StatInfo[statName].abbr .. ": 100",
+        offset = offset,
+        duration = 0.5,
+        color = StatInfo[statName].color
+    })
+end
+
+task.wait(0.7)
+NotificationQueue:add({
+    text = "RAMPAGE MODE",
+    offset = Vector3.new(0, 6, 0),
+    duration = 2,
+    color = Color3.fromRGB(139, 0, 0)
+})
+
+task.wait(1.8)
+
+TweenService:Create(redFlash, TweenInfo.new(0.1), {BackgroundTransparency = 0}):Play()
+task.wait(0.1)
+TweenService:Create(redFlash, TweenInfo.new(0.8), {BackgroundTransparency = 1}):Play()
+
+local explosion = ParticlePool:getParticle()
+explosion.Size = Vector3.new(8, 8, 8)
+explosion.Position = rootPart.Position
+explosion.Material = Enum.Material.Neon
+explosion.Color = Color3.fromRGB(139, 0, 0)
+explosion.Transparency = 0.2
+explosion.Shape = Enum.PartType.Ball
+explosion.Parent = workspace
+
+TweenService:Create(explosion, TweenInfo.new(0.6), {
+    Size = Vector3.new(80, 80, 80),
+    Transparency = 1
+}):Play()
+
+task.delay(0.6, function()
+    ParticlePool:returnParticle(explosion)
+end)
+
+Debris:AddItem(redFlash, 1)
+
+task.wait(0.7)
+NotificationQueue:resume()
+StateManager.systemLocked = false
+end
+function EffectsModule.createBehindYouEffect(startPos, targetPos)
+EffectsModule.createShadowPortal(startPos)
+local fadeClone = character:Clone()
+for _, part in pairs(fadeClone:GetDescendants()) do
+    if part:IsA("BasePart") then
+        part.Anchored = true
+        part.CanCollide = false
+        part.Material = Enum.Material.Neon
+        part.Color = Color3.fromRGB(138, 43, 226)
+        TweenService:Create(part, TweenInfo.new(0.3), {
+            Transparency = 1
+        }):Play()
+    end
+end
+fadeClone.Parent = workspace
+Debris:AddItem(fadeClone, 0.3)
+
+for i = 1, 15 do
+    task.spawn(function()
+        local progress = i / 15
+        local pos = startPos:Lerp(targetPos, progress)
+        
+        local shadow = ParticlePool:getParticle()
+        shadow.Size = Vector3.new(2, 4, 2)
+        shadow.Position = pos
+        shadow.Material = Enum.Material.Neon
+        shadow.Color = Color3.fromRGB(75, 0, 130)
+        shadow.Transparency = 0.5
+        shadow.Parent = workspace
+
+        TweenService:Create(shadow, TweenInfo.new(0.5), {
+            Transparency = 1,
+            Size = Vector3.new(0.5, 1, 0.5)
+        }):Play()
+
+        task.delay(0.5, function()
+            ParticlePool:returnParticle(shadow)
+        end)
+    end)
+end
+
+task.wait(0.15)
+EffectsModule.createShadowPortal(targetPos)
+
+for i = 1, Config.VFX.BEHIND_YOU_SMOKE do
+    task.spawn(function()
+        local smoke = ParticlePool:getParticle()
+        smoke.Size = Vector3.new(1, 1, 1)
+        smoke.Position = targetPos + Vector3.new(
+            math.random(-2, 2),
+            math.random(0, 3),
+            math.random(-2, 2)
+        )
+        smoke.Material = Enum.Material.Neon
+        smoke.Color = Color3.fromRGB(75, 0, 130)
+        smoke.Transparency = 0.3
+        smoke.Parent = workspace
+        
+        local mesh = Instance.new("SpecialMesh")
+        mesh.MeshType = Enum.MeshType.Sphere
+        mesh.Parent = smoke
+
+        TweenService:Create(smoke, TweenInfo.new(0.6), {
+            Position = smoke.Position + Vector3.new(
+                math.random(-4, 4),
+                math.random(2, 5),
+                math.random(-4, 4)
+            ),
+            Size = Vector3.new(2, 2, 2),
+            Transparency = 1
+        }):Play()
+
+        task.delay(0.6, function()
+            mesh:Destroy()
+            ParticlePool:returnParticle(smoke)
+        end)
+    end)
+end
+
+local arrivalShock = ParticlePool:getParticle()
+arrivalShock.Size = Vector3.new(2, 0.5, 2)
+arrivalShock.Position = targetPos
+arrivalShock.Material = Enum.Material.Neon
+arrivalShock.Color = Color3.fromRGB(138, 43, 226)
+arrivalShock.Transparency = 0.3
+arrivalShock.Parent = workspace
+
+local shockMesh = Instance.new("CylinderMesh")
+shockMesh.Parent = arrivalShock
+
+TweenService:Create(arrivalShock, TweenInfo.new(0.5), {
+    Size = Vector3.new(15, 0.5, 15),
+    Transparency = 1
+}):Play()
+
+task.delay(0.5, function()
+    shockMesh:Destroy()
+    ParticlePool:returnParticle(arrivalShock)
+end)
+end
+-- ═══════════════════════════════════════════════════════════════
+-- ⚡ ABILITY SYSTEM
+-- ═══════════════════════════════════════════════════════════════
+local AbilityModule = {}
+function AbilityModule.performShadowStep()
+if PlayerData.shadowStep.isActive
+or PlayerData.shadowStep.cooldown > 0
+or not PlayerData.shadowStep.unlocked
+or not rootPart
+or not InputAuthority:canUseAbility()
+then
+return
+end
+InputAuthority:lockAbilities(0.5)
+PlayerData.shadowStep.isActive = true
+
+local camera = workspace.CurrentCamera
+local lookVector = camera.CFrame.LookVector
+local targetPos = rootPart.Position + (lookVector * (_G.shadowStepRange or 50))
+
+local rayParams = RaycastParams.new()
+rayParams.FilterDescendantsInstances = {character}
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local ray = workspace:Raycast(rootPart.Position, lookVector * (_G.shadowStepRange or 50), rayParams)
+if ray then
+    targetPos = ray.Position + (ray.Normal * 3)
+end
+
+task.spawn(function()
+    EffectsModule.createShadowPortal(rootPart.Position)
+    EffectsModule.createShadowStepTrail(rootPart.Position, targetPos)
+end)
+
+rootPart.CFrame = CFrame.new(targetPos, targetPos + lookVector)
+FollowController:signalMovementOverride()
+
+task.spawn(function()
+    EffectsModule.createShadowPortal(targetPos)
+end)
+
+PlayerData.shadowStep.uses = PlayerData.shadowStep.uses + 1
+local usesNeeded = PlayerData.shadowStep.level <= 10 and 5 or 8
+
+if PlayerData.shadowStep.uses >= usesNeeded and PlayerData.shadowStep.level < 50 then
+    PlayerData.shadowStep.level = PlayerData.shadowStep.level + 1
+    PlayerData.shadowStep.uses = 0
+    NotificationQueue:add({
+        text = "SHADOW STEP LV UP",
+        offset = Vector3.new(0, 3, 0),
+        duration = 1.5,
+        color = Color3.fromRGB(138, 43, 226)
+    })
+end
+
+PlayerData.shadowStep.cooldown = _G.shadowStepMaxCooldown or 10
+PlayerData.shadowStep.isActive = false
+UIModule.updateAbilityButtons()
+DataModule.savePlayerData(PlayerData)
+end
+function AbilityModule.activateRampage()
+if PlayerData.rampage.isActive
+or PlayerData.rampage.cooldown > 0
+or not PlayerData.rampage.unlocked
+or not rootPart
+or not InputAuthority:canUseAbility()
+then
+return
+end
+InputAuthority:lockSystem(7)
+
+task.spawn(function()
+    EffectsModule.createRampageCutscene()
+end)
+
+task.wait(6.5)
+
+PlayerData.rampage.isActive = true
+
+PlayerData.rampage.originalStats = {}
+for stat, value in pairs(PlayerData.stats) do
+    PlayerData.rampage.originalStats[stat] = value
+    PlayerData.stats[stat] = Config.MAX_STAT_VALUE
+end
+
+StatCalculator.applyStatEffects()
+PlayerData.shadowStep.cooldown = 0
+
+UIModule.updateUI()
+UIModule.updateAbilityButtons()
+
+task.spawn(function()
+    EffectsModule.createSungJinWooAura()
+end)
+
+task.wait(PlayerData.rampage.duration)
+
+PlayerData.rampage.isActive = false
+
+for stat, value in pairs(PlayerData.rampage.originalStats) do
+    PlayerData.stats[stat] = value
+end
+PlayerData.rampage.originalStats = nil
+
+StatCalculator.applyStatEffects()
+
+PlayerData.behindYou.cooldown = 0
+PlayerData.rampage.cooldown = PlayerData.rampage.maxCooldown
+
+UIModule.updateUI()
+UIModule.updateAbilityButtons()
+DataModule.savePlayerData(PlayerData)
+InputAuthority:unlockAll()
+end
+function AbilityModule.performBehindYou()
+if not PlayerData.rampage.isActive
+or PlayerData.behindYou.cooldown > 0
+or not rootPart
+or not InputAuthority:canUseAbility()
+then
+return
+end
+InputAuthority:lockAbilities(1.5)
+
+local nearestPlayer, nearestDistance = nil, math.huge
+
+for _, otherPlayer in pairs(Players:GetPlayers()) do
+    if otherPlayer ~= player and otherPlayer.Character then
+        local otherRoot = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if otherRoot then
+            local distance = (rootPart.Position - otherRoot.Position).Magnitude
+            if distance >= Config.BEHIND_YOU_MIN_RANGE
+                and distance <= Config.BEHIND_YOU_MAX_RANGE
+                and distance < nearestDistance
+            then
+                nearestDistance = distance
+                nearestPlayer = otherPlayer
+            end
+        end
+    end
+end
+
+if not nearestPlayer then 
+    InputAuthority:unlockAll()
+    return 
+end
+
+local targetRoot = nearestPlayer.Character.HumanoidRootPart
+local startPos = rootPart.Position
+local targetPos = targetRoot.Position - (targetRoot.CFrame.LookVector * 5)
+
+task.spawn(function()
+    EffectsModule.createBehindYouEffect(startPos, targetPos)
+end)
+
+task.wait(0.15)
+
+rootPart.CFrame = CFrame.new(targetPos, targetRoot.Position)
+FollowController:signalMovementOverride()
+
+PlayerData.behindYou.cooldown = PlayerData.behindYou.maxCooldown
+UIModule.updateAbilityButtons()
+end
+-- ═══════════════════════════════════════════════════════════════
+-- 🖥️ UI MODULE (FIXED DESCRIPTION POSITIONING)
+-- ═══════════════════════════════════════════════════════════════
+UIModule = {}
+local mainPart
+local isVisible = false
+local acceptedNotification = false
+local levelValueLabel, xpBar, xpTextLabel, rankLabel, titleLabel, pointsValueLabel
+local hpBar, hpTextLabel, shadowStepButton, cooldownBar, statsButton
+local ssLevelLabel, classLabel, statusLabel, rampageButton, behindYouButton
+function UIModule.createRoundedFrame(parent, size, position, bgColor, transparency)
+local frame = Instance.new("Frame")
+frame.Size = size
+frame.Position = position
+frame.BackgroundColor3 = bgColor
+frame.BackgroundTransparency = transparency or 0
+frame.BorderSizePixel = 0
+frame.Parent = parent
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 12)
+corner.Parent = frame
+
+return frame
+end
+function UIModule.createTextLabel(parent, text, size, position, textColor, fontSize, font, alignment)
+local label = Instance.new("TextLabel")
+label.Text = text
+label.Size = size
+label.Position = position
+label.TextColor3 = textColor or Color3.fromRGB(255, 255, 255)
+label.Font = font or Enum.Font.GothamBold
+label.TextSize = fontSize or 24
+label.BackgroundTransparency = 1
+label.TextXAlignment = alignment or Enum.TextXAlignment.Left
+label.TextYAlignment = Enum.TextYAlignment.Center
+label.TextWrapped = true
+label.Parent = parent
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 2
+stroke.Color = Color3.fromRGB(0, 0, 0)
+stroke.Transparency = 0.3
+stroke.Parent = label
+
+return label
+end
+function UIModule.createButton(parent, text, size, position, bgColor, textColor, fontSize, callback)
+local button = Instance.new("TextButton")
+button.Text = text
+button.Size = size
+button.Position = position
+button.BackgroundColor3 = bgColor
+button.TextColor3 = textColor
+button.Font = Enum.Font.GothamBold
+button.TextSize = fontSize
+button.BorderSizePixel = 0
+button.AutoButtonColor = false
+button.Parent = parent
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = button
+
+if callback then
+    button.MouseButton1Click:Connect(callback)
+    button.TouchTap:Connect(callback)
+end
+
+button.MouseEnter:Connect(function()
+    TweenService:Create(button, TweenInfo.new(0.2), {
+        BackgroundColor3 = Color3.new(
+            math.min(bgColor.R + 0.2, 1),
+            math.min(bgColor.G + 0.2, 1),
+            math.min(bgColor.B + 0.2, 1)
+        )
+    }):Play()
+end)
+
+button.MouseLeave:Connect(function()
+    TweenService:Create(button, TweenInfo.new(0.2), {
+        BackgroundColor3 = bgColor
+    }):Play()
+end)
+
+return button
+end
+function UIModule.updateUI()
+if not acceptedNotification then return end
+if levelValueLabel then
+    levelValueLabel.Text = PlayerData.level .. "/" .. Config.LEVEL_CAP
+end
+
+if xpBar and xpTextLabel then
+    local maxXP = LevelSystem.calculateRequiredXP(PlayerData.level)
+    local progress = math.clamp(PlayerData.xp / maxXP, 0, 1)
+    TweenService:Create(xpBar, TweenInfo.new(0.35), {
+        Size = UDim2.new(progress, 0, 1, 0)
+    }):Play()
+    xpTextLabel.Text = "EXP: " .. PlayerData.xp .. "/" .. maxXP
+end
+
+if hpBar and hpTextLabel and humanoid then
+    local hpPercent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+    TweenService:Create(hpBar, TweenInfo.new(0.2), {
+        Size = UDim2.new(hpPercent, 0, 1, 0)
+    }):Play()
+    hpTextLabel.Text = math.floor(humanoid.Health) .. "/" .. math.floor(humanoid.MaxHealth)
+end
+
+if pointsValueLabel then
+    pointsValueLabel.Text = tostring(PlayerData.availablePoints)
+end
+
+local currentRank = LevelSystem.getCurrentRank()
+if rankLabel then
+    rankLabel.Text = currentRank.name
+    rankLabel.TextColor3 = currentRank.color
+end
+
+if titleLabel then titleLabel.Text = currentRank.title:upper() end
+if classLabel then classLabel.Text = LevelSystem.getCurrentClass():upper() end
+if statusLabel then statusLabel.Text = currentRank.status end
+if ssLevelLabel then ssLevelLabel.Text = "LV " .. PlayerData.shadowStep.level end
+end
+function UIModule.updateAbilityButtons()
+if shadowStepButton and PlayerData.shadowStep.unlocked then
+shadowStepButton.Visible = true
+if PlayerData.shadowStep.cooldown > 0 then
+shadowStepButton.BackgroundColor3 = Color3.fromRGB(51, 51, 51)
+shadowStepButton.TextColor3 = Color3.fromRGB(150, 150, 150)
+else
+shadowStepButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+shadowStepButton.TextColor3 = Color3.fromRGB(138, 43, 226)
+end
+if cooldownBar then
+local progress = PlayerData.shadowStep.cooldown > 0
+and (1 - (PlayerData.shadowStep.cooldown / (_G.shadowStepMaxCooldown or 10)))
+or 1
+cooldownBar.Size = UDim2.new(progress, 0, 0, 4)
+end
+end
+if rampageButton and PlayerData.rampage.unlocked then
+    rampageButton.Visible = true
+    
+    if PlayerData.rampage.cooldown > 0 or PlayerData.rampage.isActive then
+        rampageButton.BackgroundColor3 = Color3.fromRGB(70, 0, 0)
+        rampageButton.TextColor3 = Color3.fromRGB(150, 150, 150)
+        rampageButton.Text = PlayerData.rampage.cooldown > 0
+            and string.format("%.0fs", PlayerData.rampage.cooldown)
+            or "ACTIVE"
+    else
+        rampageButton.BackgroundColor3 = Color3.fromRGB(139, 0, 0)
+        rampageButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+        rampageButton.Text = "RAGE"
+    end
+end
+
+if behindYouButton then
+    behindYouButton.Visible = PlayerData.rampage.isActive
+    
+    if PlayerData.behindYou.cooldown > 0 then
+        behindYouButton.BackgroundColor3 = Color3.fromRGB(40, 0, 65)
+        behindYouButton.TextColor3 = Color3.fromRGB(150, 150, 150)
+    else
+        behindYouButton.BackgroundColor3 = Color3.fromRGB(75, 0, 130)
+        behindYouButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    end
+end
+end
+function UIModule.showStatDescription(statData)
+if not StateManager:canInteract() then return end
+if StateManager.activeDescription then
+UIModule.closeAllDescriptions()
+return
+end
+if not mainPart or not rootPart then return end
+
+local descPart = Instance.new("Part")
+descPart.Name = "StatDescriptionPart"
+descPart.Size = Vector3.new(12, 9, 0.2)
+-- CRITICAL FIX: Position description IN FRONT (negative Z offset)
+descPart.CFrame = mainPart.CFrame * CFrame.new(0, 0, -3)
+descPart.Anchored = true
+descPart.CanCollide = false
+descPart.Transparency = 0.05
+descPart.Material = Enum.Material.ForceField
+descPart.Parent = workspace
+
+FollowController:setDescriptionPart(descPart)
+
+local surfaceGui = Instance.new("SurfaceGui")
+surfaceGui.Face = Enum.NormalId.Front
+surfaceGui.CanvasSize = Vector2.new(1200, 900)
+surfaceGui.LightInfluence = 0
+surfaceGui.Brightness = 2
+surfaceGui.AlwaysOnTop = true
+surfaceGui.Parent = descPart
+
+local descFrame = UIModule.createRoundedFrame(
+    surfaceGui,
+    UDim2.new(0, 0, 0, 0),
+    UDim2.new(0.5, 0, 0.5, 0),
+    Color3.fromRGB(15, 20, 35),
+    0
+)
+descFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+
+TweenService:Create(descFrame, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+    Size = UDim2.new(1, 0, 1, 0)
+}):Play()
+
+local frameStroke = Instance.new("UIStroke")
+frameStroke.Color = statData.color
+frameStroke.Thickness = 8
+frameStroke.Parent = descFrame
+
+local titleBar = UIModule.createRoundedFrame(
+    descFrame,
+    UDim2.new(1, 0, 0, 90),
+    UDim2.new(0, 0, 0, 0),
+    statData.color,
+    0
+)
+
+UIModule.createTextLabel(
+    titleBar,
+    statData.title,
+    UDim2.new(1, -20, 1, 0),
+    UDim2.new(0, 10, 0, 0),
+    Color3.fromRGB(255, 255, 255),
+    32,
+    Enum.Font.GothamBold,
+    Enum.TextXAlignment.Center
+)
+
+local scrollFrame = Instance.new("ScrollingFrame")
+scrollFrame.Size = UDim2.new(1, -60, 0, 680)
+scrollFrame.Position = UDim2.new(0, 30, 0, 110)
+scrollFrame.BackgroundTransparency = 1
+scrollFrame.BorderSizePixel = 0
+scrollFrame.ScrollBarThickness = 8
+scrollFrame.ScrollBarImageColor3 = statData.color
+scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+scrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scrollFrame.Parent = descFrame
+
+local descText = UIModule.createTextLabel(
+    scrollFrame,
+    statData.description,
+    UDim2.new(1, -20, 0, 0),
+    UDim2.new(0, 10, 0, 10),
+    Color3.fromRGB(220, 220, 220),
+    20,
+    Enum.Font.Gotham,
+    Enum.TextXAlignment.Left
+)
+descText.TextYAlignment = Enum.TextYAlignment.Top
+descText.AutomaticSize = Enum.AutomaticSize.Y
+
+UIModule.createButton(
+    descFrame,
+    "CLOSE",
+    UDim2.new(0, 300, 0, 60),
+    UDim2.new(0.5, -150, 1, -80),
+    Color3.fromRGB(51, 65, 85),
+    Color3.fromRGB(255, 255, 255),
+    24,
+    function()
+        UIModule.closeAllDescriptions()
+    end
+)
+
+StateManager.activeDescription = descPart
+
+task.delay(15, function()
+    if StateManager.activeDescription == descPart then
+        UIModule.closeAllDescriptions()
+    end
+end)
+end
+function UIModule.showAbilityDescription(abilityName)
+if not StateManager:canInteract() then return end
+if StateManager.activeDescription then
+UIModule.closeAllDescriptions()
+return
+end
+if not mainPart or not rootPart then return end
+
+local abilityInfo = AbilityCodex:getAbilityInfo(abilityName, PlayerData)
+if not abilityInfo then return end
+
+local descPart = Instance.new("Part")
+descPart.Name = "AbilityDescriptionPart"
+descPart.Size = Vector3.new(14, 10, 0.2)
+-- CRITICAL FIX: Position description IN FRONT (negative Z offset)
+descPart.CFrame = mainPart.CFrame * CFrame.new(0, 0, -3)
+descPart.Anchored = true
+descPart.CanCollide = false
+descPart.Transparency = 0.05
+descPart.Material = Enum.Material.ForceField
+descPart.Parent = workspace
+FollowController:setDescriptionPart(descPart)
+
+local surfaceGui = Instance.new("SurfaceGui")
+surfaceGui.Face = Enum.NormalId.Front
+surfaceGui.CanvasSize = Vector2.new(1400, 1000)
+surfaceGui.LightInfluence = 0
+surfaceGui.Brightness = 2
+surfaceGui.AlwaysOnTop = true
+surfaceGui.Parent = descPart
+
+local descFrame = UIModule.createRoundedFrame(
+    surfaceGui,
+    UDim2.new(0, 0, 0, 0),
+    UDim2.new(0.5, 0, 0.5, 0),
+    Color3.fromRGB(15, 20, 35),
+    0
+)
+descFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+
+TweenService:Create(descFrame, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+    Size = UDim2.new(1, 0, 1, 0)
+}):Play()
+
+local frameStroke = Instance.new("UIStroke")
+frameStroke.Color = Color3.fromRGB(138, 43, 226)
+frameStroke.Thickness = 8
+frameStroke.Parent = descFrame
+
+local titleBar = UIModule.createRoundedFrame(
+    descFrame,
+    UDim2.new(1, 0, 0, 100),
+    UDim2.new(0, 0, 0, 0),
+    Color3.fromRGB(138, 43, 226),
+    0
+)
+
+UIModule.createTextLabel(
+    titleBar,
+    abilityInfo.name:upper(),
+    UDim2.new(1, -20, 0, 50),
+    UDim2.new(0, 10, 0, 10),
+    Color3.fromRGB(255, 255, 255),
+    36,
+    Enum.Font.GothamBold,
+    Enum.TextXAlignment.Center
+)
+
+UIModule.createTextLabel(
+    titleBar,
+    abilityInfo.category .. " • Unlock: Level " .. abilityInfo.unlockLevel,
+    UDim2.new(1, -20, 0, 30),
+    UDim2.new(0, 10, 0, 60),
+    Color3.fromRGB(200, 200, 200),
+    18,
+    Enum.Font.Gotham,
+    Enum.TextXAlignment.Center
+)
+
+local scrollFrame = Instance.new("ScrollingFrame")
+scrollFrame.Size = UDim2.new(1, -60, 0, 780)
+scrollFrame.Position = UDim2.new(0, 30, 0, 120)
+scrollFrame.BackgroundTransparency = 1
+scrollFrame.BorderSizePixel = 0
+scrollFrame.ScrollBarThickness = 10
+scrollFrame.ScrollBarImageColor3 = Color3.fromRGB(138, 43, 226)
+scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+scrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scrollFrame.Parent = descFrame
+
+local descText = UIModule.createTextLabel(
+    scrollFrame,
+    abilityInfo.description,
+    UDim2.new(1, -20, 0, 0),
+    UDim2.new(0, 10, 0, 10),
+    Color3.fromRGB(220, 220, 220),
+    18,
+    Enum.Font.Gotham,
+    Enum.TextXAlignment.Left
+)
+descText.TextYAlignment = Enum.TextYAlignment.Top
+descText.AutomaticSize = Enum.AutomaticSize.Y
+
+UIModule.createButton(
+    descFrame,
+    "CLOSE",
+    UDim2.new(0, 350, 0, 70),
+    UDim2.new(0.5, -175, 1, -90),
+    Color3.fromRGB(51, 65, 85),
+    Color3.fromRGB(255, 255, 255),
+    26,
+    function()
+        UIModule.closeAllDescriptions()
+    end
+)
+
+StateManager.activeDescription = descPart
+
+task.delay(20, function()
+    if StateManager.activeDescription == descPart then
+        UIModule.closeAllDescriptions()
+    end
+end)
+end
+function UIModule.closeAllDescriptions()
+if StateManager.activeDescription then
+local descToClose = StateManager.activeDescription
+local surfaceGui = descToClose:FindFirstChildOfClass("SurfaceGui")
+if surfaceGui then
+local frame = surfaceGui:FindFirstChild("Frame")
+if frame then
+TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+Size = UDim2.new(0, 0, 0, 0)
+}):Play()
+end
+end
+TweenService:Create(descToClose, TweenInfo.new(0.3), {
+        Transparency = 1
+    }):Play()
+    
+    task.delay(0.3, function()
+        if descToClose and descToClose.Parent then
+            descToClose:Destroy()
+        end
+    end)
+    
+    StateManager.activeDescription = nil
+    FollowController:setDescriptionPart(nil)
+end
+end
+function UIModule.createMainUI()
+local hrp = character:WaitForChild("HumanoidRootPart")
+mainPart = Instance.new("Part")
+mainPart.Name = "StatSystemObject"
+mainPart.Size = Vector3.new(14, 8, 0.2)
+local characterLook = hrp.CFrame.LookVector
+mainPart.CFrame = CFrame.new(hrp.Position + (characterLook * 8) + Vector3.new(0, 2, 0), hrp.Position)
+
+mainPart.Anchored = true
+mainPart.CanCollide = false
+mainPart.Transparency = 1
+mainPart.Material = Enum.Material.ForceField
+mainPart.Parent = workspace
+
+FollowController:initialize(mainPart)
+
+local surfaceGui = Instance.new("SurfaceGui")
+surfaceGui.Face = Enum.NormalId.Front
+surfaceGui.CanvasSize = Vector2.new(1400, 800)
+surfaceGui.LightInfluence = 0
+surfaceGui.Brightness = 2
+surfaceGui.Enabled = false
+surfaceGui.AlwaysOnTop = true
+surfaceGui.Parent = mainPart
+
+local playerGui = player:WaitForChild("PlayerGui")
+local toggleGui = Instance.new("ScreenGui")
+toggleGui.Name = "StatToggleGui"
+toggleGui.ResetOnSpawn = false
+toggleGui.Parent = playerGui
+
+local buttonContainer = Instance.new("Frame")
+buttonContainer.Size = UDim2.new(0, 65, 0, 225)
+buttonContainer.Position = UDim2.new(0, 20, 0.5, -112)
+buttonContainer.BackgroundTransparency = 1
+buttonContainer.Parent = toggleGui
+
+statsButton = UIModule.createButton(
+    buttonContainer,
+    "STATS",
+    UDim2.new(0, 60, 0, 60),
+    UDim2.new(0, 2, 0, 0),
+    Color3.fromRGB(8, 145, 178),
+    Color3.fromRGB(255, 255, 255),
+    20,
+    function()
+        if not InputAuthority:canInteractUI() then return end
+        
+        isVisible = not isVisible
+        
+        if isVisible then
+            InputAuthority:lockUI(0.5)
+            StateManager:setState("OPENING", 0.5)
+            FollowController:forceResync()
+            
+            mainPart.Transparency = 0.05
+            surfaceGui.Enabled = true
+            local mainFrame = surfaceGui:FindFirstChild("MainFrame")
+            if mainFrame then
+                mainFrame.Size = UDim2.new(1, 0, 0, 0)
+                TweenService:Create(mainFrame, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                    Size = UDim2.new(1, 0, 1, 0)
+                }):Play()
+            end
+            
+            task.delay(0.5, function()
+                StateManager:setState("OPEN")
+            end)
+        else
+            InputAuthority:lockUI(0.3)
+            StateManager:setState("CLOSING", 0.3)
+            UIModule.closeAllDescriptions()
+            
+            local mainFrame = surfaceGui:FindFirstChild("MainFrame")
+            if mainFrame then
+                TweenService:Create(mainFrame, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+                    Size = UDim2.new(1, 0, 0, 0)
+                }):Play()
+            end
+            
+            task.delay(0.3, function()
+                surfaceGui.Enabled = false
+                mainPart.Transparency = 1
+                StateManager:setState("CLOSED")
+            end)
+        end
+    end
+)
+
+local statsCorner = Instance.new("UICorner")
+statsCorner.CornerRadius = UDim.new(0, 10)
+statsCorner.Parent = statsButton
+
+shadowStepButton = UIModule.createButton(
+    buttonContainer,
+    "DASH",
+    UDim2.new(0, 60, 0, 60),
+    UDim2.new(0, 2, 0, 72),
+    Color3.fromRGB(51, 51, 51),
+    Color3.fromRGB(150, 150, 150),
+    16,
+    AbilityModule.performShadowStep
+)
+shadowStepButton.Visible = PlayerData.shadowStep.unlocked
+
+local shadowCorner = Instance.new("UICorner")
+shadowCorner.CornerRadius = UDim.new(0, 10)
+shadowCorner.Parent = shadowStepButton
+
+local ssInfoButton = UIModule.createButton(
+    shadowStepButton,
+    "?",
+    UDim2.new(0, 18, 0, 18),
+    UDim2.new(1, -20, 0, 2),
+    Color3.fromRGB(30, 30, 30),
+    Color3.fromRGB(138, 43, 226),
+    14,
+    function()
+        UIModule.showAbilityDescription("ShadowStep")
+    end
+)
+
+ssLevelLabel = UIModule.createTextLabel(
+    shadowStepButton,
+    "LV " .. PlayerData.shadowStep.level,
+    UDim2.new(1, 0, 0, 18),
+    UDim2.new(0, 0, 1, -20),
+    Color3.fromRGB(138, 43, 226),
+    11
+)
+ssLevelLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+cooldownBar = Instance.new("Frame")
+cooldownBar.Size = UDim2.new(1, 0, 0, 4)
+cooldownBar.Position = UDim2.new(0, 0, 1, -4)
+cooldownBar.BackgroundColor3 = Color3.fromRGB(138, 43, 226)
+cooldownBar.BorderSizePixel = 0
+cooldownBar.Parent = shadowStepButton
+
+rampageButton = UIModule.createButton(
+    buttonContainer,
+    "RAGE",
+    UDim2.new(0, 60, 0, 60),
+    UDim2.new(0, 2, 0, 144),
+    Color3.fromRGB(139, 0, 0),
+    Color3.fromRGB(255, 255, 255),
+    18,
+    AbilityModule.activateRampage
+)
+rampageButton.Visible = PlayerData.rampage.unlocked
+
+local rampageCorner = Instance.new("UICorner")
+rampageCorner.CornerRadius = UDim.new(0, 10)
+rampageCorner.Parent = rampageButton
+
+local rampageInfoButton = UIModule.createButton(
+    rampageButton,
+    "?",
+    UDim2.new(0, 18, 0, 18),
+    UDim2.new(1, -20, 0, 2),
+    Color3.fromRGB(30, 30, 30),
+    Color3.fromRGB(255, 60, 60),
+    14,
+    function()
+        UIModule.showAbilityDescription("Rampage")
+    end
+)
+
+behindYouButton = UIModule.createButton(
+    buttonContainer,
+    "BEHIND\nYOU",
+    UDim2.new(0, 60, 0, 60),
+    UDim2.new(1, -65, 0, 144),
+    Color3.fromRGB(75, 0, 130),
+    Color3.fromRGB(255, 255, 255),
+    14,
+    AbilityModule.performBehindYou
+)
+behindYouButton.Visible = false
+
+local behindCorner = Instance.new("UICorner")
+behindCorner.CornerRadius = UDim.new(0, 10)
+behindCorner.Parent = behindYouButton
+
+local behindInfoButton = UIModule.createButton(
+    behindYouButton,
+    "?",
+    UDim2.new(0, 18, 0, 18),
+    UDim2.new(1, -20, 0, 2),
+    Color3.fromRGB(30, 30, 30),
+    Color3.fromRGB(138, 43, 226),
+    14,
+    function()
+        UIModule.showAbilityDescription("BehindYou")
+    end
+)
+
+-- Main UI Frame (continuing from previous section)
+local mainFrame = UIModule.createRoundedFrame(
+    surfaceGui,
+    UDim2.new(1, 0, 0, 0),
+    UDim2.new(0, 0, 0, 0),
+    Color3.fromRGB(10, 15, 30),
+    0
+)
+mainFrame.Name = "MainFrame"
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(6, 182, 212)
+mainStroke.Thickness = 10
+mainStroke.Parent = mainFrame
+
+local titleSection = UIModule.createRoundedFrame(
+    mainFrame,
+    UDim2.new(1, 0, 0, 80),
+    UDim2.new(0, 0, 0, 0),
+    Color3.fromRGB(15, 20, 35),
+    0
+)
+
+UIModule.createTextLabel(
+    titleSection,
+    "SYSTEM",
+    UDim2.new(1, -40, 1, 0),
+    UDim2.new(0, 20, 0, 0),
+    Color3.fromRGB(6, 182, 212),
+    42,
+    Enum.Font.GothamBold,
+    Enum.TextXAlignment.Center
+)
+
+local hpSection = Instance.new("Frame")
+hpSection.Size = UDim2.new(1, -60, 0, 60)
+hpSection.Position = UDim2.new(0, 30, 0, 95)
+hpSection.BackgroundTransparency = 1
+hpSection.Parent = mainFrame
+
+UIModule.createTextLabel(
+    hpSection,
+    "HP",
+    UDim2.new(0, 60, 0, 32),
+    UDim2.new(0, 0, 0, 14),
+    Color3.fromRGB(239, 68, 68),
+    28
+)
+
+local hpBarBg = UIModule.createRoundedFrame(
+    hpSection,
+    UDim2.new(0, 900, 0, 32),
+    UDim2.new(0, 70, 0, 14),
+    Color3.fromRGB(20, 25, 40),
+    0
+)
+
+local hpBorder = Instance.new("UIStroke")
+hpBorder.Color = Color3.fromRGB(239, 68, 68)
+hpBorder.Thickness = 3
+hpBorder.Parent = hpBarBg
+
+hpBar = UIModule.createRoundedFrame(
+    hpBarBg,
+    UDim2.new(1, 0, 1, 0),
+    UDim2.new(0, 0, 0, 0),
+    Color3.fromRGB(220, 38, 38),
+    0
+)
+
+hpTextLabel = UIModule.createTextLabel(
+    hpBar,
+    math.floor(humanoid.Health) .. "/" .. math.floor(humanoid.MaxHealth),
+    UDim2.new(1, -15, 1, 0),
+    UDim2.new(0, 0, 0, 0),
+    Color3.fromRGB(255, 255, 255),
+    22,
+    Enum.Font.GothamBold,
+    Enum.TextXAlignment.Right
+)
+
+UIModule.createTextLabel(
+    hpSection,
+    "LV",
+    UDim2.new(0, 50, 0, 32),
+    UDim2.new(1, -180, 0, 14),
+    Color3.fromRGB(150, 150, 150),
+    24
+)
+
+levelValueLabel = UIModule.createTextLabel(
+    hpSection,
+    PlayerData.level .. "/" .. Config.LEVEL_CAP,
+    UDim2.new(0, 125, 0, 32),
+    UDim2.new(1, -125, 0, 14),
+    Color3.fromRGB(255, 255, 255),
+    24
+)
+
+local xpBarBg = UIModule.createRoundedFrame(
+    mainFrame,
+    UDim2.new(1, -60, 0, 22),
+    UDim2.new(0, 30, 0, 167),
+    Color3.fromRGB(20, 25, 40),
+    0
+)
+
+local xpBorder = Instance.new("UIStroke")
+xpBorder.Color = Color3.fromRGB(34, 211, 238)
+xpBorder.Thickness = 3
+xpBorder.Parent = xpBarBg
+
+xpBar = UIModule.createRoundedFrame(
+    xpBarBg,
+    UDim2.new(PlayerData.xp / LevelSystem.calculateRequiredXP(PlayerData.level), 0, 1, 0),
+    UDim2.new(0, 0, 0, 0),
+    Color3.fromRGB(34, 211, 238),
+    0
+)
+
+xpTextLabel = UIModule.createTextLabel(
+    xpBarBg,
+    "EXP: " .. PlayerData.xp .. "/" .. LevelSystem.calculateRequiredXP(PlayerData.level),
+    UDim2.new(1, -12, 1, 0),
+    UDim2.new(0, 12, 0, 0),
+    Color3.fromRGB(255, 255, 255),
+    18,
+    Enum.Font.GothamBold,
+    Enum.TextXAlignment.Left
+)
+
+local statsContainer = Instance.new("Frame")
+statsContainer.Size = UDim2.new(1, -60, 0, 320)
+statsContainer.Position = UDim2.new(0, 30, 0, 205)
+statsContainer.BackgroundTransparency = 1
+statsContainer.Parent = mainFrame
+
+local function createStatRow(statKey, yPos, xPos)
+    local stat = StatInfo[statKey]
+    local statFrame = UIModule.createRoundedFrame(
+        statsContainer,
+        UDim2.new(0, 650, 0, 85),
+        UDim2.new(0, xPos, 0, yPos),
+        Color3.fromRGB(20, 25, 40),
+        0
+    )
+    
+    local statBorder = Instance.new("UIStroke")
+    statBorder.Color = stat.color
+    statBorder.Thickness = 3
+    statBorder.Parent = statFrame
+    
+    local abbrBox = UIModule.createRoundedFrame(
+        statFrame,
+        UDim2.new(0, 90, 0, 55),
+        UDim2.new(0, 15, 0, 15),
+        Color3.fromRGB(15, 20, 35),
+        0
+    )
+    
+    local abbrBorder = Instance.new("UIStroke")
+    abbrBorder.Color = stat.color
+    abbrBorder.Thickness = 3
+    abbrBorder.Parent = abbrBox
+    
+    UIModule.createTextLabel(
+        abbrBox,
+        stat.abbr,
+        UDim2.new(1, 0, 1, 0),
+        UDim2.new(0, 0, 0, 0),
+        stat.color,
+        26,
+        Enum.Font.GothamBold,
+        Enum.TextXAlignment.Center
+    )
+    
+    UIModule.createTextLabel(
+        statFrame,
+        stat.name,
+        UDim2.new(0, 180, 0, 40),
+        UDim2.new(0, 115, 0, 22),
+        Color3.fromRGB(220, 220, 220),
+        24
+    )
+    
+    local valueLabel = UIModule.createTextLabel(
+        statFrame,
+        tostring(PlayerData.stats[statKey]),
+        UDim2.new(0, 65, 0, 40),
+        UDim2.new(0, 300, 0, 22),
+        Color3.fromRGB(255, 255, 255),
+        32,
+        Enum.Font.GothamBold,
+        Enum.TextXAlignment.Center
+    )
+    
+    local effectLabel = UIModule.createTextLabel(
+        statFrame,
+        stat.getEffect(PlayerData.stats[statKey]),
+        UDim2.new(0, 160, 0, 26),
+        UDim2.new(0, 375, 0, 29),
+        stat.color,
+        18,
+        Enum.Font.Gotham,
+        Enum.TextXAlignment.Left
+    )
+    
+    UIModule.createButton(
+        statFrame,
+        "?",
+        UDim2.new(0, 35, 0, 35),
+        UDim2.new(0, 540, 0, 25),
+        Color3.fromRGB(30, 35, 50),
+        Color3.fromRGB(200, 200, 200),
+        22,
+        function()
+            UIModule.showStatDescription(stat)
+        end
+    )
+    
+    UIModule.createButton(
+        statFrame,
+        "+",
+        UDim2.new(0, 45, 0, 45),
+        UDim2.new(0, 585, 0, 20),
+        Color3.fromRGB(51, 65, 85),
+        stat.color,
+        30,
+        function()
+            if PlayerData.availablePoints > 0 and PlayerData.stats[statKey] < Config.MAX_STAT_VALUE then
+                PlayerData.stats[statKey] = math.min(PlayerData.stats[statKey] + 1, Config.MAX_STAT_VALUE)
+                PlayerData.availablePoints = PlayerData.availablePoints - 1
+                
+                StatCalculator.applyStatEffects()
+                task.spawn(function()
+                    EffectsModule.createStatUpgradeEffect(statKey)
+                end)
+                
+                valueLabel.Text = tostring(PlayerData.stats[statKey])
+                effectLabel.Text = stat.getEffect(PlayerData.stats[statKey])
+                UIModule.updateUI()
+            end
+        end
+    )
+end
+
+createStatRow("strength", 0, 0)
+createStatRow("agility", 95, 0)
+createStatRow("perception", 190, 0)
+createStatRow("vitality", 0, 700)
+createStatRow("intelligence", 95, 700)
+
+local pointsBox = UIModule.createRoundedFrame(
+    statsContainer,
+    UDim2.new(0, 650, 0, 75),
+    UDim2.new(0, 700, 0, 200),
+    Color3.fromRGB(20, 30, 50),
+    0
+)
+
+local pointsStroke = Instance.new("UIStroke")
+pointsStroke.Color = Color3.fromRGB(34, 211, 238)
+pointsStroke.Thickness = 5
+pointsStroke.Parent = pointsBox
+
+UIModule.createTextLabel(
+    pointsBox,
+    "Available Points",
+    UDim2.new(0, 380, 1, 0),
+    UDim2.new(0, 30, 0, 0),
+    Color3.fromRGB(220, 220, 220),
+    26
+)
+
+pointsValueLabel = UIModule.createTextLabel(
+    pointsBox,
+    tostring(PlayerData.availablePoints),
+    UDim2.new(0, 220, 1, 0),
+    UDim2.new(1, -240, 0, 0),
+    Color3.fromRGB(34, 211, 238),
+    38,
+    Enum.Font.GothamBold,
+    Enum.TextXAlignment.Center
+)
+
+local infoContainer = Instance.new("Frame")
+infoContainer.Size = UDim2.new(1, -60, 0, 160)
+infoContainer.Position = UDim2.new(0, 30, 0, 540)
+infoContainer.BackgroundTransparency = 1
+infoContainer.Parent = mainFrame
+
+local function createInfoRow(label, value, xPos, yPos, valueColor)
+    UIModule.createTextLabel(
+        infoContainer,
+        label,
+        UDim2.new(0, 160, 0, 50),
+        UDim2.new(0, xPos, 0, yPos),
+        Color3.fromRGB(160, 160, 160),
+        24
+    )
+    
+    local valueText = UIModule.createTextLabel(
+        infoContainer,
+        value,
+        UDim2.new(0, 470, 0, 50),
+        UDim2.new(0, xPos + 165, 0, yPos),
+        valueColor,
+        26,
+        Enum.Font.GothamBold,
+        Enum.TextXAlignment.Right
+    )
+    valueText.TextScaled = true
+    return valueText
+end
+
+local currentRank = LevelSystem.getCurrentRank()
+rankLabel = createInfoRow("RANK", currentRank.name, 0, 10, currentRank.color)
+classLabel = createInfoRow("CLASS", LevelSystem.getCurrentClass():upper(), 0, 58, Color3.fromRGB(168, 85, 247))
+titleLabel = createInfoRow("TITLE", currentRank.title:upper(), 680, 10, Color3.fromRGB(248, 113, 113))
+statusLabel = createInfoRow("STATUS", currentRank.status, 680, 58, Color3.fromRGB(34, 211, 238))
+
+UIModule.updateUI()
+end
+function UIModule.createInitialNotification()
+local notifPart = Instance.new("Part")
+notifPart.Name = "NotificationPart"
+notifPart.Size = Vector3.new(12, 7, 0.2)
+local characterLook = rootPart.CFrame.LookVector
+notifPart.CFrame = CFrame.new(rootPart.Position + (characterLook * 8) + Vector3.new(0, 3, 0), rootPart.Position)
+notifPart.Anchored = true
+notifPart.CanCollide = false
+notifPart.Transparency = 0.05
+notifPart.Material = Enum.Material.ForceField
+notifPart.Parent = workspace
+local surfaceGui = Instance.new("SurfaceGui")
+surfaceGui.Face = Enum.NormalId.Front
+surfaceGui.CanvasSize = Vector2.new(1200, 700)
+surfaceGui.LightInfluence = 0
+surfaceGui.Brightness = 2
+surfaceGui.AlwaysOnTop = true
+surfaceGui.Parent = notifPart
+
+local bg = UIModule.createRoundedFrame(
+    surfaceGui,
+    UDim2.new(1, 0, 1, 0),
+    UDim2.new(0, 0, 0, 0),
+    Color3.fromRGB(10, 15, 30),
+    0
+)
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(6, 182, 212)
+stroke.Thickness = 10
+stroke.Parent = bg
+
+UIModule.createTextLabel(
+    bg,
+    "SYSTEM NOTIFICATION",
+    UDim2.new(1, -40, 0, 90),
+    UDim2.new(0, 20, 0, 35),
+    Color3.fromRGB(6, 182, 212),
+    44,
+    Enum.Font.GothamBold,
+    Enum.TextXAlignment.Center
+)
+
+UIModule.createTextLabel(
+    bg,
+    "You have acquired the qualifications\nto become a Player.\n\nThe System has recognized your potential.\nWill you accept this power?",
+    UDim2.new(1, -80, 0, 180),
+    UDim2.new(0, 40, 0, 145),
+    Color3.fromRGB(220, 220, 220),
+    26,
+    Enum.Font.Gotham,
+    Enum.TextXAlignment.Center
+)
+
+UIModule.createButton(
+    bg,
+    "ACCEPT",
+    UDim2.new(0, 380, 0, 90),
+    UDim2.new(0, 80, 1, -130),
+    Color3.fromRGB(8, 145, 178),
+    Color3.fromRGB(255, 255, 255),
+    32,
+    function()
+        acceptedNotification = true
+TweenService:Create(notifPart, TweenInfo.new(0.3), {Transparency = 1}):Play()
+task.wait(0.3)
+notifPart:Destroy()
+UIModule.createMainUI()
+end
+)
+UIModule.createButton(
+    bg,
+    "DECLINE",
+    UDim2.new(0, 380, 0, 90),
+    UDim2.new(1, -460, 1, -130),
+    Color3.fromRGB(51, 65, 85),
+    Color3.fromRGB(255, 255, 255),
+    32,
+    function()
+        acceptedNotification = false
+        TweenService:Create(notifPart, TweenInfo.new(0.3), {Transparency = 1}):Play()
+        task.wait(0.3)
+        notifPart:Destroy()
+    end
+)
+
+task.spawn(function()
+    local t = 0
+    while notifPart and notifPart.Parent do
+        t = t + task.wait(0.05)
+        local bobY = math.sin(t * 2) * 0.3
+        
+        if character and character:FindFirstChild("HumanoidRootPart") then
+            local hrp = character.HumanoidRootPart
+            local charLook = hrp.CFrame.LookVector
+            local targetPos = hrp.Position + (charLook * 8) + Vector3.new(0, 3 + bobY, 0)
+            local lookAtPos = Vector3.new(hrp.Position.X, notifPart.Position.Y, hrp.Position.Z)
+            notifPart.CFrame = notifPart.CFrame:Lerp(CFrame.new(targetPos, lookAtPos), 0.12)
+        end
+    end
+end)
+end
+-- ═══════════════════════════════════════════════════════════════
+-- 🎮 PLAYER MONITORING
+-- ═══════════════════════════════════════════════════════════════
+local function monitorPlayers()
+pcall(function()
+for _, otherPlayer in pairs(Players:GetPlayers()) do
+if otherPlayer ~= player and otherPlayer.Character then
+CombatModule.setupHealthMonitoring(otherPlayer)
+end
+end
+end)
+end
+-- ═══════════════════════════════════════════════════════════════
+-- 🔄 UNIFIED UPDATE LOOP
+-- ═══════════════════════════════════════════════════════════════
+local function startUnifiedUpdateLoop()
+local accumulators = {ui = 0, regen = 0, cleanup = 0, monitor = 0, autosave = 0}
+local updateInterval = 0.1
+RunService.Heartbeat:Connect(function(deltaTime)
+    pcall(function()
+        accumulators.ui = accumulators.ui + deltaTime
+        if accumulators.ui >= updateInterval then
+            accumulators.ui = 0
+            
+            local shouldUpdateUI = acceptedNotification and (isVisible or PlayerData.shadowStep.cooldown > 0 or PlayerData.rampage.cooldown > 0)
+            
+            if PlayerData.shadowStep.cooldown > 0 then
+                PlayerData.shadowStep.cooldown = math.max(0, PlayerData.shadowStep.cooldown - updateInterval)
+                if shouldUpdateUI then
+                    UIModule.updateAbilityButtons()
+                end
+            end
+            
+            if PlayerData.rampage.cooldown > 0 then
+                PlayerData.rampage.cooldown = math.max(0, PlayerData.rampage.cooldown - updateInterval)
+                if shouldUpdateUI then
+                    UIModule.updateAbilityButtons()
+                end
+            end
+            
+            if PlayerData.behindYou.cooldown > 0 then
+                PlayerData.behindYou.cooldown = math.max(0, PlayerData.behindYou.cooldown - updateInterval)
+                if shouldUpdateUI then
+                    UIModule.updateAbilityButtons()
+                end
+            end
+        end
+        
+        accumulators.regen = accumulators.regen + deltaTime
+        if accumulators.regen >= 1 then
+            accumulators.regen = 0
+            if humanoid and humanoid.Health > 0 and humanoid.Health < humanoid.MaxHealth then
+                local regenAmount = PlayerData.stats.vitality * Config.STAT_CURVES.vitality.regenPerPoint
+                if regenAmount > 0 then
+                    humanoid.Health = math.min(humanoid.Health + regenAmount, humanoid.MaxHealth)
+                    if isVisible then
+                        UIModule.updateUI()
+                    end
+                end
+            end
+        end
+        
+        accumulators.cleanup = accumulators.cleanup + deltaTime
+        if accumulators.cleanup >= 5 then
+            accumulators.cleanup = 0
+            local currentTime = tick()
+            
+            for userId, data in pairs(PlayerData.damageDealt) do
+                if currentTime - data.lastHit > Config.COMBAT_TIMEOUT then
+                    PlayerData.damageDealt[userId] = nil
+                end
+            end
+        end
+        
+        accumulators.monitor = accumulators.monitor + deltaTime
+        if accumulators.monitor >= 2 then
+            accumulators.monitor = 0
+            monitorPlayers()
+        end
+        
+        accumulators.autosave = accumulators.autosave + deltaTime
+        if accumulators.autosave >= 30 then
+            accumulators.autosave = 0
+            DataModule.savePlayerData(PlayerData)
+        end
+    end)
+end)
+end
+-- ═══════════════════════════════════════════════════════════════
+-- 🛡️ SECOND CHANCE SYSTEM
+-- ═══════════════════════════════════════════════════════════════
+local function setupSecondChance()
+if not humanoid then return end
+humanoid.Died:Connect(function()
+    if PlayerData.hasSecondChance and PlayerData.stats.vitality >= Config.STAT_CURVES.vitality.secondChanceThreshold then
+        task.wait(0.1)
+        if humanoid and humanoid.Health <= 0 then
+            humanoid.Health = PlayerData.maxHP * 0.5
+            PlayerData.hasSecondChance = false
+            
+            task.spawn(function()
+                EffectsModule.createSecondChanceEffect()
+                NotificationQueue:add({
+                    text = "SECOND CHANCE",
+                    offset = Vector3.new(0, 3, 0),
+                    duration = 1.5,
+                    color = Color3.fromRGB(168, 85, 247)
+                })
+            end)
+            
+            task.wait(60)
+            PlayerData.hasSecondChance = true
+            if PlayerData.stats.vitality >= Config.STAT_CURVES.vitality.secondChanceThreshold then
+                NotificationQueue:add({
+                    text = "SECOND CHANCE READY",
+                    offset = Vector3.new(0, 3, 0),
+                    duration = 1.5,
+                    color = Color3.fromRGB(168, 85, 247)
+                })
+            end
+        end
+    end
+end)
+
+humanoid.HealthChanged:Connect(function()
+    if isVisible then
+        UIModule.updateUI()
+    end
+end)
+
+humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(function()
+    if isVisible then
+        UIModule.updateUI()
+    end
+end)
+end
+-- ═══════════════════════════════════════════════════════════════
+-- ⌨️ INPUT HANDLING
+-- ═══════════════════════════════════════════════════════════════
+local function setupInputHandling()
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+if gameProcessed then return end
+if not InputAuthority:canUseAbility() then return end
+if input.KeyCode == Enum.KeyCode.E then
+        AbilityModule.performShadowStep()
+    end
+    
+    if input.KeyCode == Enum.KeyCode.R then
+        AbilityModule.activateRampage()
+    end
+    
+    if input.KeyCode == Enum.KeyCode.F then
+        AbilityModule.performBehindYou()
+    end
+end)
+end
+-- ═══════════════════════════════════════════════════════════════
+-- 🔄 CHARACTER RESPAWN HANDLING
+-- ═══════════════════════════════════════════════════════════════
+player.CharacterAdded:Connect(function(newCharacter)
+character = newCharacter
+humanoid = newCharacter:WaitForChild("Humanoid")
+rootPart = newCharacter:WaitForChild("HumanoidRootPart")
+humanoid.MaxHealth = PlayerData.maxHP
+humanoid.Health = PlayerData.maxHP
+
+if PlayerData.stats.vitality >= Config.STAT_CURVES.vitality.secondChanceThreshold then
+    PlayerData.hasSecondChance = true
+end
+
+task.wait(0.2)
+StatCalculator.applyStatEffects()
+SpeedController:activate(newCharacter)
+UIModule.updateUI()
+
+if acceptedNotification and mainPart then
+    task.wait(0.5)
+    FollowController:forceResync()
+end
+
+setupSecondChance()
+end)
+-- ═══════════════════════════════════════════════════════════════
+-- 🚀 INITIALIZATION
+-- ═══════════════════════════════════════════════════════════════
+local function initialize()
+pcall(function()
+StatCalculator.applyStatEffects()
+SpeedController:activate(character)
+if humanoid then
+        humanoid.MaxHealth = PlayerData.maxHP
+        humanoid.Health = PlayerData.maxHP
+    end
+    
+    setupInputHandling()
+    setupSecondChance()
+    
+    task.defer(function()
+        startUnifiedUpdateLoop()
+        monitorPlayers()
+        
+        Players.PlayerAdded:Connect(function()
+            task.wait(1)
+            monitorPlayers()
+        end)
+    end)
+    
+    task.wait(0.5)
+    UIModule.createInitialNotification()
+end)
+end
+initialize()
